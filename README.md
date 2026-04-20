@@ -51,7 +51,7 @@ Client Request (Запрос клиента)
 
 ```bash
 # Клонирование репозитория
-git clone https://github.com/your-org/scientific-fastapi.git
+git clone https://github.com/Artem7898/scientific_fastapi
 cd scientific-fastapi
 
 # Создание виртуального окружения и установка зависимостей
