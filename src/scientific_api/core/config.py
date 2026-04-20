@@ -7,9 +7,9 @@ class Settings(BaseSettings):
     Uses strict validation to fail fast on misconfigurations.
     """
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env_local_backup",
         env_file_encoding="utf-8",
-        strict=True,  # Запрещает неявные преобразования типов в .env
+        strict=True,  # Запрещает неявные преобразования типов в .env_local_backup
     )
 
     app_name: str = "Scientific API"

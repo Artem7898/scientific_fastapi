@@ -1,15 +1,11 @@
-version: '3.8'
-
 services:
-  # 1. Научное API (FastAPI + Воркер)
   api:
     build: .
     container_name: sci_api
     ports:
       - "8000:8000"
     environment:
-      # Перекрываем настройки из .env для Docker-среды
-      - REDIS_URI=redis://redis:6379/0
+      # - REDIS_URI=redis://redis:6379/0
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - MLFLOW_EXPERIMENT_NAME=production_physics
     depends_on:
@@ -19,19 +15,17 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  # 2. Брокер сообщений и кэш (для очереди задач)
   redis:
     image: redis:7-alpine
     container_name: sci_redis
     ports:
-      - "6379:6379" # Доступен с хоста для дебага
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # 3. Сервер трекинга экспериментов (MLflow)
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.17.0
     container_name: sci_mlflow
@@ -44,7 +38,7 @@ services:
       --backend-store-uri sqlite:///mlflow.db 
       --default-artifact-root ./mlflow-artifacts
     volumes:
-      - mlflow_data:/mlflow # Сохраняем базу данных между перезапусками
+      - mlflow_data:/mlflow
     restart: unless-stopped
 
 volumes:
