@@ -8,7 +8,7 @@ authors:
 license: MIT
 version: 0.3.0
 date-released: "2025-10-27"
-url: "https://github.com/your-username/scientific_fastapi"
+url: "https://github.com/Artem7898/scientific_fastapi"
 abstract: "A high-performance, strictly-typed FastAPI framework implementing Domain-Driven Design, background task queues, and automated MLflow experiment tracking for reproducible computational science."
 keywords:
   - "fastapi"
