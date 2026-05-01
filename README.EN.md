@@ -203,18 +203,14 @@ scientific_fastapi/
 5. Open the Pull Request
 
 ---
-###  The Author of the project is Artem Alimpiev
+  The Author of the project is Artem Alimpiev
+https://orcid.org/0009-0007-6740-7242
 
-## 📄 License
+ 📄 License
 
 Distributed under the MIT license. See [LICENSE](LICENSE) for details.
 
 ---
 
-<div align="center">
 
-**[⬆ Up](#-scientific-api-gateway)**
 
-Made with 🔬 for Science
-
-</div>
