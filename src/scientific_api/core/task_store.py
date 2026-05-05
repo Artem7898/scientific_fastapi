@@ -26,9 +26,12 @@ class TaskStore:
     def get(self, task_id: str) -> dict | None:
         if self._redis:
             data = self._redis.get(f"task:{task_id}")
-            return json.loads(data) if data else None
+            if data is not None:
+                return json.loads(str(data))
+            return None
         else:
-            return json.loads(self._memory.get(task_id, "null"))
+            raw = self._memory.get(task_id, "null")
+            return json.loads(raw)
 
 # Глобальный синглтон
 task_store = TaskStore()

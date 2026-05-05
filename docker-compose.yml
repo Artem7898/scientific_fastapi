@@ -1,45 +1,72 @@
+version: "3.9"
+
 services:
   api:
     build: .
     container_name: sci_api
-    ports:
-      - "8000:8000"
-    environment:
-      # - REDIS_URI=redis://redis:6379/0
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - MLFLOW_EXPERIMENT_NAME=production_physics
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       mlflow:
         condition: service_started
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - REDIS_HOST=redis
+    expose:
+      - "8000"
+    networks:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    container_name: sci_nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
     restart: unless-stopped
+    networks:
+      - backend
 
   redis:
     image: redis:7-alpine
     container_name: sci_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 3s
       retries: 5
+    networks:
+      - backend
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.17.0
     container_name: sci_mlflow
-    ports:
-      - "5000:5000"
+    restart: unless-stopped
     command: >
-      mlflow server 
-      --host 0.0.0.0 
-      --port 5000 
-      --backend-store-uri sqlite:///mlflow.db 
-      --default-artifact-root ./mlflow-artifacts
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlflow/artifacts
     volumes:
       - mlflow_data:/mlflow
-    restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16   # 💥 фикс твоей ошибки с сетями
 
 volumes:
+  redis_data:
   mlflow_data:

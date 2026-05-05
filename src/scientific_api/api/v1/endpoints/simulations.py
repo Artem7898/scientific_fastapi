@@ -50,7 +50,7 @@ async def submit_simulation(payload: SimulationRequest):
 
 @router.get(
     "/status/{task_id}",
-    response_model=SimulationResponse | dict[str, str, Any],
+    response_model=SimulationResponse | dict[str, Any],
     summary="Get simulation results by task ID"
 )
 async def get_simulation_status(task_id: str):
