@@ -184,7 +184,7 @@ scientific_fastapi/
 
 
 
-## 🔧 Requirements
+ 🔧 Requirements
 
 - **Python:** 3.12+
 - **Package Manager:** [uv](https://docs.astral.sh/uv/)
@@ -194,7 +194,7 @@ scientific_fastapi/
 
 ---
 
-## 🤝 Contribution to the project
+ 🤝 Contribution to the project
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature')
@@ -204,8 +204,8 @@ scientific_fastapi/
 
 ---
   The Author of the project is Artem Alimpiev
-#### https://orcid.org/0009-0007-6740-7242
-#### https://doi.org/10.5281/zenodo.20057106
+ https://orcid.org/0009-0007-6740-7242
+ https://doi.org/10.5281/zenodo.20057106
  📄 License
 
 Distributed under the MIT license. See [LICENSE](LICENSE) for details.
