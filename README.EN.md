@@ -204,8 +204,8 @@ scientific_fastapi/
 
 ---
   The Author of the project is Artem Alimpiev
-https://orcid.org/0009-0007-6740-7242
-
+#### https://orcid.org/0009-0007-6740-7242
+#### https://doi.org/10.5281/zenodo.20057106
  📄 License
 
 Distributed under the MIT license. See [LICENSE](LICENSE) for details.
