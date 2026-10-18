@@ -62,7 +62,9 @@ class GitHub:
         self.other_releases = []
         self.assets = {}
         self.mutations = []
+        self.operations = []
         self.fail_upload = False
+        self.hide_draft_from_index = False
 
     def draft(self):
         self.state = {
@@ -75,13 +77,43 @@ class GitHub:
             "html_url": "https://github.com/example/releases/tag/v2.0.0",
         }
 
-    def run(self, *args, binary=False):
+    def run(self, *args, binary=False, input_data=None):
         if args[:3] == ("git", "rev-parse", "HEAD"):
             return SHA + "\n"
         if args[:2] == ("gh", "api"):
+            if "--method" in args:
+                self.mutations.append(args)
+                method = args[args.index("--method") + 1]
+                if args[2].startswith("https://uploads.github.com/"):
+                    self.operations.append("upload")
+                    assert method == "POST" and "Content-Type: application/octet-stream" in args
+                    assert "/releases/1/assets?name=" in args[2]
+                    if self.fail_upload:
+                        raise subprocess.CalledProcessError(1, args, stderr="Upload interrupted")
+                    asset = Path(args[args.index("--input") + 1])
+                    asset_id = len(self.assets) + 1
+                    self.assets[asset_id] = asset.read_bytes()
+                    result = {"id": asset_id, "name": asset.name}
+                    self.state["assets"].append(result)
+                    return json.dumps(result)
+                payload = json.loads(input_data)
+                if method == "POST" and args[2] == f"repos/{REPOSITORY}/releases":
+                    self.operations.append("create")
+                    assert payload["target_commitish"] == SHA and payload["draft"] is True
+                    assert payload["tag_name"] == "v2.0.0"
+                    self.draft()
+                elif method == "PATCH" and args[2] == f"repos/{REPOSITORY}/releases/1":
+                    self.operations.append("edit")
+                    assert payload == {"draft": False, "make_latest": "true"}
+                    self.state["draft"] = False
+                    self.tag = SHA
+                else:
+                    raise AssertionError(f"Unexpected API write: {args}")
+                return json.dumps(self.state)
             if "--paginate" in args:
                 assert "--slurp" not in args
-                return json.dumps(self.other_releases + ([self.state] if self.state else []))
+                visible = self.state and not self.hide_draft_from_index
+                return json.dumps(self.other_releases + ([self.state] if visible else []))
             path = args[2].removeprefix(f"repos/{REPOSITORY}").removeprefix("/")
             if path == "":
                 result = {"default_branch": "main", "full_name": REPOSITORY}
@@ -110,26 +142,7 @@ class GitHub:
             else:
                 raise AssertionError(f"Unexpected API read: {args}")
             return json.dumps(result)
-        self.mutations.append(args)
-        assert args[:2] == ("gh", "release")
-        if args[2] == "create":
-            assert "--draft" in args and args[args.index("--target") + 1] == SHA
-            self.draft()
-        elif args[2] == "upload":
-            if self.fail_upload:
-                raise subprocess.CalledProcessError(1, args, stderr="Upload interrupted")
-            for filename in args[4 : args.index("--repo")]:
-                asset = Path(filename)
-                asset_id = len(self.assets) + 1
-                self.assets[asset_id] = asset.read_bytes()
-                self.state["assets"].append({"id": asset_id, "name": asset.name})
-        elif args[2] == "edit":
-            assert "--draft=false" in args and "--latest" in args
-            self.state["draft"] = False
-            self.tag = SHA
-        else:
-            raise AssertionError(f"Unexpected mutation: {args}")
-        return ""
+        raise AssertionError(f"Unexpected command: {args}")
 
 
 @pytest.fixture
@@ -224,11 +237,36 @@ def test_paginated_release_response_rejects_non_list_page(release, github, monke
 
 def test_publishes_only_after_verifying_all_assets(release, github):
     publisher.publish(release)
-    assert [command[2] for command in github.mutations] == ["create", "upload", "edit"]
+    assert github.operations == ["create", "upload", "upload", "upload", "edit"]
     assert github.tag == SHA and not github.state["draft"]
     assert len(github.assets) == 3
     checksum = next(item for item in github.state["assets"] if item["name"] == "SHA256SUMS")
     assert github.assets[checksum["id"]].count(b"\n") == 2
+
+
+def test_creation_response_survives_draft_missing_from_release_index(release, github):
+    github.hide_draft_from_index = True
+    publisher.publish(release)
+    assert github.operations == ["create", "upload", "upload", "upload", "edit"]
+    assert github.tag == SHA and not github.state["draft"]
+
+
+def test_creation_response_must_match_the_requested_commit(release, github, monkeypatch):
+    original_run = github.run
+
+    def run(*args, **kwargs):
+        result = original_run(*args, **kwargs)
+        if args[2:3] == (f"repos/{REPOSITORY}/releases",) and "--method" in args:
+            response = json.loads(result)
+            response["target_commitish"] = OTHER_SHA
+            return json.dumps(response)
+        return result
+
+    monkeypatch.setattr(publisher, "run", run)
+    with pytest.raises(ValueError, match="requested draft and commit"):
+        publisher.publish(release)
+    assert github.operations == ["create"]
+    assert github.tag is None and github.state["draft"]
 
 
 def test_failed_upload_leaves_draft_then_resumes(release, github):
@@ -239,7 +277,7 @@ def test_failed_upload_leaves_draft_then_resumes(release, github):
     github.fail_upload = False
     publisher.publish(release)
     assert not github.state["draft"]
-    assert sum(command[2] == "create" for command in github.mutations) == 1
+    assert github.operations.count("create") == 1
 
 
 def test_resume_verifies_existing_assets_and_refuses_to_overwrite(release, github):
@@ -257,8 +295,8 @@ def test_partial_upload_resumes_without_replacing_existing_asset(release, github
     github.state["assets"] = [{"id": 1, "name": files[0].name}]
     github.assets[1] = files[0].read_bytes()
     publisher.publish(release)
-    upload = next(command for command in github.mutations if command[2] == "upload")
-    assert str(files[0]) not in upload
+    uploads = [command for command in github.mutations if command[2].startswith("https://")]
+    assert all(str(files[0]) not in command for command in uploads)
     assert len(github.assets) == 3 and not github.state["draft"]
 
 
@@ -267,7 +305,7 @@ def test_main_moving_during_upload_leaves_unpublished_draft(release, github, mon
 
     def run(*args, **kwargs):
         result = original_run(*args, **kwargs)
-        if args[:3] == ("gh", "release", "upload"):
+        if args[:2] == ("gh", "api") and args[2].startswith("https://uploads.github.com/"):
             github.head = OTHER_SHA
         return result
 
@@ -275,7 +313,7 @@ def test_main_moving_during_upload_leaves_unpublished_draft(release, github, mon
     with pytest.raises(ValueError, match="no longer the current main"):
         publisher.publish(release)
     assert github.state["draft"] and github.tag is None
-    assert not any(command[2] == "edit" for command in github.mutations)
+    assert "edit" not in github.operations
 
 
 def test_rejects_wheel_with_incorrect_embedded_version(release, github):
@@ -304,3 +342,36 @@ def test_draft_for_other_commit_is_not_reused(release, github):
     with pytest.raises(ValueError, match="another commit"):
         publisher.publish(release)
     assert github.mutations == []
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_cli_reports_github_error_reason_without_tokens(release, monkeypatch, binary):
+    monkeypatch.setenv("GH_TOKEN", "gh-secret-do-not-log")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret-do-not-log")
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--sha", SHA])
+    monkeypatch.setattr(publisher, "metadata", lambda *args: release)
+    detail = (
+        "gh: Resource not accessible by integration (HTTP 403); "
+        "GH_TOKEN=gh-secret-do-not-log; GITHUB_TOKEN=github-secret-do-not-log"
+    )
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(
+            1,
+            ("gh", "release", "create", "v2.0.0"),
+            stderr=detail.encode() if binary else detail,
+        )
+
+    monkeypatch.setattr(publisher, "publish", fail)
+    with pytest.raises(SystemExit) as caught:
+        publisher.main()
+    message = str(caught.value)
+    assert "Resource not accessible by integration (HTTP 403)" in message
+    assert message.count("[REDACTED]") == 2
+    assert "gh-secret-do-not-log" not in message
+    assert "github-secret-do-not-log" not in message
+
+
+def test_other_command_stderr_is_not_reported():
+    error = subprocess.CalledProcessError(1, ("git", "rev-parse", "HEAD"), stderr="private data")
+    assert "private data" not in publisher.failure_reason(error)
