@@ -1,36 +1,54 @@
+"""Reference equilibrium thermostat, with an exact stochastic transition."""
+
+import math
+
 import numpy as np
+from numpy.typing import NDArray
+
+from ..domain.simulation import SimulationParameters
 
 
 class IdealGasSimulator:
-    """
-    Simplified 2D ideal gas simulator for demonstration.
-    In production, replace with Numba/JAX/C++ bindings.
+    """Independent 2D velocities at target temperature in reduced units.
+
+    This demonstrates the Ornstein-Uhlenbeck thermostat
+    ``dv = -v dt + sqrt(2 T) dW`` with unit relaxation rate, mass and Boltzmann
+    constant. The exact transition preserves Maxwellian equilibrium for any
+    positive time step. There are no positions, collisions or interparticle
+    forces; this is not a molecular dynamics solver.
     """
 
-    def __init__(self, num_particles: int, initial_temp: float, dt: float):
-        self.num_particles = num_particles
-        self.dt = dt
-        # Maxwell-Boltzmann distribution initialization
-        self.velocities = np.random.normal(
-            loc=0.0,
-            scale=np.sqrt(initial_temp),
-            size=(num_particles, 2)
+    def __init__(self, num_particles: int, initial_temp: float, dt: float, seed: int = 0) -> None:
+        parameters = SimulationParameters(
+            initial_temperature=initial_temp,
+            num_particles=num_particles,
+            time_step=dt,
+            num_steps=1,
+            seed=seed,
         )
+        self.num_particles = parameters.num_particles
+        self.dt = parameters.time_step
+        self.target_temperature = parameters.initial_temperature
+        self.rng = np.random.Generator(np.random.PCG64(parameters.seed))
+        self.velocities: NDArray[np.float64] = self.rng.normal(
+            loc=0.0, scale=math.sqrt(self.target_temperature), size=(num_particles, 2)
+        )
+        self._decay = math.exp(-self.dt)
+        # expm1 keeps 1 - exp(-2 dt) accurate for small time steps.
+        self._noise_scale = math.sqrt(self.target_temperature * -math.expm1(-2.0 * self.dt))
+
+    def observables(self) -> tuple[float, float]:
+        """Return temperature and energy, rejecting nonfinite computations."""
+        with np.errstate(over="raise", invalid="raise"):
+            kinetic_energy = float(0.5 * np.einsum("ij,ij->", self.velocities, self.velocities))
+        effective_temperature = kinetic_energy / self.num_particles
+        if not math.isfinite(kinetic_energy) or not math.isfinite(effective_temperature):
+            raise FloatingPointError("Simulation produced nonfinite observables")
+        return effective_temperature, kinetic_energy
 
     def step(self) -> tuple[float, float]:
-        """
-        Performs one integration step.
-        Returns:
-            tuple[float, float]: Effective temperature and total kinetic energy.
-        """
-        # In a real system: apply forces, boundary conditions, etc.
-        # Here we just add small noise to simulate stochastic dynamics
-        self.velocities += np.random.normal(0, self.dt, size=self.velocities.shape)
-
-        # Kinetic energy: E_k = 0.5 * m * v^2 (assuming m=1)
-        kinetic_energy = 0.5 * np.sum(self.velocities ** 2)
-
-        # Effective temperature: T = 2 * E_k / (N * k_B * dof), assuming k_B=1, dof=2
-        effective_temp = kinetic_energy / self.num_particles
-
-        return effective_temp, kinetic_energy
+        """Advance one exact OU transition and return terminal observables."""
+        with np.errstate(over="raise", invalid="raise"):
+            self.velocities *= self._decay
+            self.velocities += self._noise_scale * self.rng.standard_normal(self.velocities.shape)
+        return self.observables()

@@ -1,5 +1,6 @@
-from typing import Any, Protocol
 from abc import abstractmethod
+from pathlib import Path
+from typing import Any, Protocol
 
 
 class ExperimentTracker(Protocol):
@@ -27,3 +28,27 @@ class ExperimentTracker(Protocol):
     def end_run(self) -> None:
         """Finalize the experiment run."""
         ...
+
+
+class NullTracker:
+    """The default tracker has no optional imports and performs no I/O."""
+
+    run_id: str | None = None
+
+    def start_run(self, run_name: str) -> None:
+        pass
+
+    def log_params(self, params: dict[str, Any]) -> None:
+        pass
+
+    def log_metrics(self, metrics: dict[str, float]) -> None:
+        pass
+
+    def end_run(self) -> None:
+        pass
+
+    def log_artifact(self, path: str | Path) -> None:
+        pass
+
+    def mark_failed(self) -> None:
+        pass

@@ -1,59 +1,87 @@
-import logging
+"""An optional MLflow adapter with per-run state and explicit failures."""
+
+from contextvars import ContextVar
+from importlib import import_module
+from pathlib import Path
 from typing import Any
 
-import mlflow
-
-
-logger = logging.getLogger(__name__)
+from ..core.experiment_tracker import ExperimentTracker, NullTracker
 
 
 class MLflowTracker:
-    """
-    Concrete implementation of ExperimentTracker for MLflow.
-    Acts as an anti-corruption layer between our domain and MLflow's API.
-    """
+    """Use a dedicated client instead of changing MLflow's global active run."""
 
-    def __init__(self, tracking_uri: str, experiment_name: str):
+    def __init__(self, tracking_uri: str, experiment_name: str) -> None:
         if not tracking_uri:
-            logger.warning("MLflow tracking URI is not set. Experiment tracking is disabled.")
-            self._disabled = True
-            return
+            raise ValueError(
+                "MLflowTracker requires a tracking URI; use build_tracker to disable it"
+            )
+        try:
+            module = import_module("mlflow.tracking")
+        except ImportError as exc:
+            raise RuntimeError(
+                "MLflow tracking is configured but unavailable; install scientific-api[tracking]"
+            ) from exc
+        try:
+            self._client = module.MlflowClient(tracking_uri=tracking_uri)
+            experiment = self._client.get_experiment_by_name(experiment_name)
+            self._experiment_id = (
+                experiment.experiment_id
+                if experiment is not None
+                else self._client.create_experiment(experiment_name)
+            )
+        except Exception as exc:
+            raise RuntimeError("Unable to initialize the configured MLflow experiment") from exc
+        # Context-local run IDs allow parallel worker threads/tasks to share the client.
+        self._run_id: ContextVar[str | None] = ContextVar("scientific_mlflow_run", default=None)
+        self._run_status: ContextVar[str] = ContextVar(
+            "scientific_mlflow_status", default="FINISHED"
+        )
 
-        mlflow.set_tracking_uri(tracking_uri)
-        mlflow.set_experiment(experiment_name)
-        self._disabled = False
-        logger.info(f"MLflow initialized. URI: {tracking_uri}, Experiment: {experiment_name}")
+    @property
+    def run_id(self) -> str | None:
+        return self._run_id.get()
 
     def start_run(self, run_name: str) -> None:
-        if self._disabled:
-            return
-        try:
-            mlflow.start_run(run_name=run_name)
-        except Exception as e:
-            logger.error(f"Failed to start MLflow run: {e}")
+        run = self._client.create_run(self._experiment_id, tags={"mlflow.runName": run_name})
+        self._run_id.set(run.info.run_id)
+        self._run_status.set("FINISHED")
+
+    def _require_run(self) -> str:
+        run_id = self.run_id
+        if run_id is None:
+            raise RuntimeError("An MLflow run must be started before logging")
+        return run_id
 
     def log_params(self, params: dict[str, Any]) -> None:
-        if self._disabled:
-            return
-        try:
-            # MLflow restricts parameter keys to alphanumeric and underscores
-            sanitized_params = {k.replace(".", "_"): v for k, v in params.items()}
-            mlflow.log_params(sanitized_params)
-        except Exception as e:
-            logger.error(f"Failed to log MLflow params: {e}")
+        run_id = self._require_run()
+        for key, value in params.items():
+            self._client.log_param(run_id, key.replace(".", "_"), value)
 
     def log_metrics(self, metrics: dict[str, float]) -> None:
-        if self._disabled:
-            return
-        try:
-            mlflow.log_metrics(metrics)
-        except Exception as e:
-            logger.error(f"Failed to log MLflow metrics: {e}")
+        run_id = self._require_run()
+        for key, value in metrics.items():
+            self._client.log_metric(run_id, key, value)
 
     def end_run(self) -> None:
-        if self._disabled:
-            return
+        run_id = self._require_run()
         try:
-            mlflow.end_run()
-        except Exception as e:
-            logger.error(f"Failed to end MLflow run: {e}")
+            self._client.set_terminated(run_id, status=self._run_status.get())
+        finally:
+            self._run_id.set(None)
+            self._run_status.set("FINISHED")
+
+    def mark_failed(self) -> None:
+        """Mark this context's run as failed before the common ``end_run`` path."""
+        self._require_run()
+        self._run_status.set("FAILED")
+
+    def log_artifact(self, path: str | Path) -> None:
+        self._client.log_artifact(self._require_run(), str(path))
+
+
+def build_tracker(tracking_uri: str, experiment_name: str) -> ExperimentTracker:
+    """Keep the default app lightweight; fail at startup when configured but broken."""
+    if not tracking_uri:
+        return NullTracker()
+    return MLflowTracker(tracking_uri, experiment_name)

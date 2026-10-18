@@ -1,70 +1,298 @@
-import uuid
-import logging
-from typing import Optional
+"""Execute a scientific experiment and persist its reproducibility record."""
 
-from ..models.physics_engine import IdealGasSimulator
-from ..schemas.simulation import SimulationRequest, SimulationResponse
+import hashlib
+import importlib.metadata
+import json
+import logging
+import math
+import os
+import platform
+import re
+import subprocess
+import tempfile
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
+from threading import Event
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
+
 from ..core.experiment_tracker import ExperimentTracker
+from ..domain.simulation import MODEL_VERSION, SimulationCancelled, SimulationParameters
+from ..models.physics_engine import IdealGasSimulator
 
 logger = logging.getLogger(__name__)
 
 
-def run_simulation(
-        request: SimulationRequest,
-        tracker: Optional[ExperimentTracker] = None  # Dependency Injection
-) -> SimulationResponse:
-    """
-    Executes the simulation synchronously.
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    Args:
-        request: Validated payload from the API layer.
-        tracker: Optional experiment tracker. If provided, logs params/metrics.
-                 Defaults to None to keep the service testable without infrastructure.
-    """
-    task_id = uuid.uuid4().hex
 
-    logger.info(
-        f"Starting simulation {task_id}: "
-        f"N={request.num_particles}, T0={request.initial_temperature}K"
-    )
-
-    # --- Инфраструктурный слой (безопасное логирование) ---
-    if tracker:
-        tracker.start_run(run_name=f"sim_{task_id}")
-        tracker.log_params(request.model_dump())
-
-    # --- Научное ядро (Pure Domain) ---
+def _environment() -> dict[str, Any]:
+    """Record versions without depending on a checkout or exposing env vars."""
     try:
-        simulator = IdealGasSimulator(
-            num_particles=request.num_particles,
-            initial_temp=request.initial_temperature,
-            dt=request.time_step
+        package_version = importlib.metadata.distribution("scientific-api").metadata.get("Version")
+        package_version = package_version or "uninstalled"
+    except importlib.metadata.PackageNotFoundError:
+        package_version = "uninstalled"
+    package_root = Path(__file__).resolve().parents[1]
+    source_digest = hashlib.sha256()
+    for source in sorted(package_root.rglob("*.py")):
+        source_digest.update(source.relative_to(package_root).as_posix().encode())
+        source_digest.update(b"\0")
+        source_digest.update(source.read_bytes())
+    commit = None
+    dirty = None
+    try:
+        checkout = package_root.parent.parent
+        commit_result = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+        commit = commit_result.stdout.strip()
+        status_result = subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        dirty = bool(status_result.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        # A wheel normally runs outside a Git checkout. The package version
+        # and source digest still identify the implementation used.
+        pass
+    lockfile = package_root.parent.parent / "uv.lock"
+    return {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "numpy": np.__version__,
+        "package_version": package_version,
+        "source_commit": commit,
+        "source_dirty": dirty,
+        "source_sha256": source_digest.hexdigest(),
+        "lockfile_sha256": _sha256(lockfile) if lockfile.is_file() else None,
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+    }
 
-        final_temp, total_energy = 0.0, 0.0
-        for _ in range(100):
-            final_temp, total_energy = simulator.step()
 
-    except Exception as e:
-        if tracker:
-            tracker.end_run()
-        logger.error(f"Simulation {task_id} failed: {e}")
-        raise  # Пробрасываем ошибку дальше к API слою
+def _write_state(path: Path, velocities: NDArray[np.float64]) -> None:
+    """Publish a complete NPZ atomically; never expose a partial artifact."""
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".state-", suffix=".npz")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            np.savez_compressed(stream, velocities=velocities)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
-    # --- Фиксация результатов ---
-    result = SimulationResponse(
-        task_id=task_id,
-        final_temperature=round(final_temp, 4),
-        total_energy=round(total_energy, 4),
-        status="completed"
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=".manifest-", suffix=".json"
     )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, allow_nan=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
-    if tracker:
-        tracker.log_metrics({
-            "final_temperature": result.final_temperature,
-            "total_energy": result.total_energy
-        })
-        tracker.end_run()
 
-    logger.info(f"Simulation {task_id} completed. Final T={final_temp:.2f}K")
-    return result
+def _check_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise SimulationCancelled("Simulation cancelled")
+
+
+def _mark_tracking_failed(tracker: ExperimentTracker) -> None:
+    mark_failed = getattr(tracker, "mark_failed", None)
+    if callable(mark_failed):
+        try:
+            mark_failed()
+        except Exception:
+            logger.warning("Failed to mark experiment tracking as failed", exc_info=True)
+
+
+def run_simulation(
+    parameters: SimulationParameters,
+    *,
+    task_id: str,
+    artifacts_dir: Path,
+    attempt_id: str | None = None,
+    tracker: ExperimentTracker | None = None,
+    cancel_event: Event | None = None,
+) -> dict[str, Any]:
+    """Compute a seeded trajectory and an auditable terminal-state artifact.
+
+    The caller owns the stable task identifier and an optional unique attempt
+    identifier. Queue workers must pass their lease owner as ``attempt_id`` so
+    a stale worker cannot overwrite another attempt's artifacts. Artifact
+    paths are relative to ``artifacts_dir``. Cancellation is cooperative at
+    step boundaries. An exception, including tracking or persistence failure,
+    is propagated to the caller instead of returning a successful experiment.
+    """
+    if not isinstance(parameters, SimulationParameters):
+        raise TypeError("parameters must be SimulationParameters")
+    if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id):
+        raise ValueError("task_id must contain 1-128 ASCII letters, digits, underscores or hyphens")
+    if attempt_id is not None and (
+        not isinstance(attempt_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attempt_id)
+    ):
+        raise ValueError(
+            "attempt_id must contain 1-128 ASCII letters, digits, underscores or hyphens"
+        )
+    _check_cancelled(cancel_event)
+    artifacts_dir = Path(artifacts_dir).resolve()
+    task_dir = artifacts_dir / task_id
+    if task_dir.is_symlink():
+        raise ValueError("Artifact directory must not be a symlink")
+    task_dir.mkdir(parents=True, exist_ok=True)
+    if task_dir.resolve().parent != artifacts_dir:
+        raise ValueError("Artifact directory must remain inside artifacts_dir")
+    run_dir = task_dir
+    if attempt_id is not None:
+        run_dir = task_dir / attempt_id
+        if run_dir.is_symlink():
+            raise ValueError("Attempt artifact directory must not be a symlink")
+        run_dir.mkdir(exist_ok=True)
+        if run_dir.resolve().parent != task_dir.resolve():
+            raise ValueError("Attempt artifact directory must remain inside the task directory")
+
+    tracking_started = False
+    failure_in_flight = False
+    try:
+        if tracker is not None:
+            tracker.start_run(run_name=f"sim_{task_id}")
+            tracking_started = True
+            tracker.log_params(
+                {
+                    **asdict(parameters),
+                    "model_version": MODEL_VERSION,
+                    "task_id": task_id,
+                    **({"attempt_id": attempt_id} if attempt_id is not None else {}),
+                }
+            )
+        simulator = IdealGasSimulator(
+            num_particles=parameters.num_particles,
+            initial_temp=parameters.initial_temperature,
+            dt=parameters.time_step,
+            seed=parameters.seed,
+        )
+        final_temperature, total_energy = simulator.observables()
+        for _ in range(parameters.num_steps):
+            _check_cancelled(cancel_event)
+            final_temperature, total_energy = simulator.step()
+        _check_cancelled(cancel_event)
+        uncertainty = parameters.initial_temperature / math.sqrt(parameters.num_particles)
+        metrics = {
+            "final_temperature": final_temperature,
+            "total_energy": total_energy,
+            "temperature_standard_error": uncertainty,
+        }
+        if not all(math.isfinite(value) for value in metrics.values()):
+            raise FloatingPointError("Simulation produced nonfinite metrics")
+        if tracker is not None:
+            tracker.log_metrics(metrics)
+
+        state_path = run_dir / "final_state.npz"
+        _write_state(state_path, simulator.velocities)
+        relative_state = state_path.relative_to(artifacts_dir).as_posix()
+        result = {
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "status": "completed",
+            **metrics,
+            "model_version": MODEL_VERSION,
+            "seed": parameters.seed,
+            "num_steps": parameters.num_steps,
+            "units": {"temperature": "reduced", "energy": "reduced", "time": "reduced"},
+            "artifacts": {
+                "manifest": (run_dir / "manifest.json").relative_to(artifacts_dir).as_posix(),
+                "final_state": relative_state,
+            },
+        }
+        manifest = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "parameters": asdict(parameters),
+            "outputs": result,
+            "model": {
+                "version": MODEL_VERSION,
+                "method": "exact Ornstein-Uhlenbeck transition",
+                "dimensions": 2,
+                "mass": 1.0,
+                "boltzmann_constant": 1.0,
+                "relaxation_rate": 1.0,
+                "target_temperature": parameters.initial_temperature,
+                "assumptions": [
+                    "Independent noninteracting particles with Maxwellian initial velocities",
+                    "Reduced units; no physical Kelvin or femtosecond conversion",
+                    "No positions, boundaries, collisions or interparticle forces",
+                ],
+            },
+            "uncertainty": {
+                "method": "Exact equilibrium standard error T_target / sqrt(num_particles)",
+                "scope": "One terminal snapshot with independent two-dimensional velocities",
+                "excludes": [
+                    "model discrepancy",
+                    "parameter uncertainty",
+                    "time-series uncertainty",
+                ],
+            },
+            "rng": {"bit_generator": "PCG64", "seed": parameters.seed, "dtype": "float64"},
+            "tracking": {"run_id": getattr(tracker, "run_id", None)},
+            "environment": _environment(),
+            "artifacts": [
+                {
+                    "path": relative_state,
+                    "sha256": _sha256(state_path),
+                    "format": "npz",
+                    "arrays": {
+                        "velocities": {"shape": [parameters.num_particles, 2], "dtype": "float64"}
+                    },
+                }
+            ],
+        }
+        _check_cancelled(cancel_event)
+        _write_manifest(run_dir / "manifest.json", manifest)
+        log_artifact = getattr(tracker, "log_artifact", None)
+        if callable(log_artifact):
+            log_artifact(state_path)
+            log_artifact(run_dir / "manifest.json")
+        logger.info("Simulation %s completed with T=%s", task_id, final_temperature)
+        return result
+    except BaseException:
+        failure_in_flight = True
+        if tracker is not None:
+            _mark_tracking_failed(tracker)
+        raise
+    finally:
+        if tracker is not None and tracking_started:
+            try:
+                tracker.end_run()
+            except Exception:
+                if failure_in_flight:
+                    logger.warning(
+                        "Failed to end experiment tracking after a run failure", exc_info=True
+                    )
+                else:
+                    _mark_tracking_failed(tracker)
+                    raise

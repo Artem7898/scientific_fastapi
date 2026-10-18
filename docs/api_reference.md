@@ -1,35 +1,115 @@
-## API Reference (v1)
-Base URL: http://localhost:8000/api/v1
+# Справочник API v1
 
-### Run Simulation
-### Executes a stochastic dynamics simulation based on ideal gas approximations.
-### Endpoint: POST /simulations/monte-carlo
-### Content-Type: application/json
+Базовый URL: `http://localhost:8000/api/v1`. OpenAPI текущего приложения доступен по `/openapi.json`; интерактивные страницы — `/docs` и `/redoc`.
 
----
+## Создать задание
 
-###  Внутренние Docstrings (Менеджмент кода)
+`POST /simulations/monte-carlo`, `Content-Type: application/json`.
 
+Название URL сохранено для совместимости. Расчёт использует модель `ideal-gas-ou-v1`: скорости независимых двумерных частиц с термостатом Орнштейна — Уленбека. Все величины заданы в безразмерных приведённых единицах с `m = k_B = 1`, `γ = 1`.
 
-Пример для `models/physics_engine.py`:
+| Поле | Тип JSON | Ограничение | По умолчанию |
+| --- | --- | --- | --- |
+| `initial_temperature` | number | конечное, `0 < T <= 1_000_000` | обязательное |
+| `num_particles` | integer | `1..1_000_000` | обязательное |
+| `time_step` | number | конечное, `0 < dt <= 1_000` | `0.001` |
+| `num_steps` | integer | `1..10_000` | `100` |
+| `seed` | integer | `0..18_446_744_073_709_551_615` | `0` |
 
-```python
-class IdealGasSimulator:
-    """
-    2D ideal gas simulator for stochastic dynamics validation.
-    
-    This module implements a simplified Langevin dynamics integrator
-    to demonstrate API architectural patterns. It uses NumPy for 
-    vectorized computations.
-    
-    Attributes:
-        num_particles (int): Total number of simulated particles ($N$).
-        velocities (np.ndarray): Array of shape (N, 2) containing 
-            velocity vectors in arbitrary units.
-            
-    Note:
-        Do not use this class for production molecular dynamics. 
-        For real simulations, replace this with OpenMM, JAX-MD, 
-        or custom Numba kernels.
-    """
-    # ...
+Неизвестные поля, строки вместо чисел, bool вместо integer и нечисловые/бесконечные значения отклоняются. Дополнительно `num_particles * num_steps <= 100_000_000`; оператор может уменьшить бюджет настройками сервера. `initial_temperature` задаёт и начальное распределение, и температуру термостата.
+
+```json
+{
+  "initial_temperature": 300.0,
+  "num_particles": 1000,
+  "time_step": 0.001,
+  "num_steps": 100,
+  "seed": 42
+}
+```
+
+Успешный приём возвращает **202 Accepted**, а не результат вычисления:
+
+```json
+{
+  "task_id": "a1b2c3d4",
+  "status": "pending",
+  "check_url": "/api/v1/simulations/status/a1b2c3d4"
+}
+```
+
+`task_id` здесь сокращён для примера. Повторная отправка одинакового тела создаёт новое задание; для воспроизводимого результата используйте те же параметры и окружение.
+
+## Получить статус или результат
+
+`GET /simulations/status/{task_id}` возвращает **200 OK** для известного задания. Ответ представляет одно из состояний:
+
+| `status` | Значение |
+| --- | --- |
+| `pending` | задание принято и ожидает вычислителя |
+| `running` | вычисление началось |
+| `completed` | расчёт и сохранение результата завершены |
+| `failed` | вычисление или необходимая инфраструктурная операция завершилась ошибкой |
+| `cancelled` | выполнение прекращено |
+
+Минимальный ожидающий ответ:
+
+```json
+{"task_id":"a1b2c3d4","status":"pending"}
+```
+
+Завершённый ответ содержит следующие научные поля; значения ниже приведены только как пример формата:
+
+```json
+{
+  "task_id": "a1b2c3d4",
+  "status": "completed",
+  "attempt_id": "9e108b11-42b2-4d92-a66d-ec07708c8d75",
+  "final_temperature": 299.5,
+  "total_energy": 299500.0,
+  "temperature_standard_error": 9.486832980505138,
+  "model_version": "ideal-gas-ou-v1",
+  "seed": 42,
+  "num_steps": 100,
+  "units": {"temperature": "reduced", "energy": "reduced", "time": "reduced"},
+  "artifacts": {
+    "manifest": "a1b2c3d4/9e108b11-42b2-4d92-a66d-ec07708c8d75/manifest.json",
+    "final_state": "a1b2c3d4/9e108b11-42b2-4d92-a66d-ec07708c8d75/final_state.npz"
+  }
+}
+```
+
+`task_id` остаётся одним и тем же после повторного исполнения задания. `attempt_id` — UUID конкретной подтверждённой попытки, завершившей расчёт. Ссылки в `artifacts` относительны к `ARTIFACTS_DIR` сервера и включают оба ID, чтобы запоздавшие вычислители не перезаписали опубликованные файлы. Manifest содержит входы, результаты, модель, RNG, окружение и SHA256 конечного состояния; `final_state.npz` содержит массив `velocities` типа `float64`, формы `(num_particles, 2)`. Для работы на нескольких машинах каталог артефактов должен быть общим.
+
+`temperature_standard_error = initial_temperature / sqrt(num_particles)` — теоретическая стандартная ошибка температуры по конечному снимку в данной модели. Это не доверительный интервал и не оценка неопределённости реального эксперимента.
+
+Ошибки задания возвращаются через терминальное состояние `failed`; успешный GET статуса сам по себе не означает успешный расчёт. Клиент должен проверять `status`, прекращать polling в терминальном состоянии и использовать разумный интервал повторов.
+
+## Скачать артефакты
+
+`GET /simulations/{task_id}/artifacts/{artifact_name}` возвращает файл из подтверждённой попытки завершённого задания. Передавать `attempt_id` в этот URL не требуется. Допустимы только имена `manifest` и `final_state`, а не произвольные пути:
+
+```bash
+curl -o manifest.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/manifest
+curl -o final_state.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/final_state
+```
+
+Для ещё исполняемого задания ответ — `409 Conflict`, для неизвестного задания или отсутствующего файла — `404`. Срок хранения статуса и файлов управляется отдельно; сохраните нужные артефакты до истечения срока доступности задания.
+
+## HTTP-ошибки
+
+| Код | Когда возникает |
+| --- | --- |
+| `422` | неверные типы, неизвестные поля, нечисловые величины, превышение диапазонов или бюджета запроса |
+| `404` | задание неизвестно, срок хранения его статуса истёк или артефакт отсутствует |
+| `409` | артефакты запрошены до завершения расчёта |
+| `503` | очередь заполнена, приложение останавливается или необходимая инфраструктура недоступна |
+
+## Проверки состояния
+
+Эти URL не имеют префикса `/api/v1`:
+
+- `GET /health/live` — процесс приложения работает.
+- `GET /health/ready` — приложение готово обслуживать запросы с текущими ресурсами. При неготовности возможен `503`.
+
+Готовность сервиса не доказывает научную корректность произвольного входа; модель и её ограничения описаны в [архитектуре](architecture.md).

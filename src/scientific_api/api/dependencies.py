@@ -1,13 +1,9 @@
-from ..core.config import settings
-from ..adapters.mlflow_adapter import MLflowTracker
+"""Resolve per-application resources without creating import-time singletons."""
 
-# Инициализация при импорте модуля (Application Startup)
-# Если settings.mlflow_tracking_uri пуст, трекер будет "заглушкой"
-_tracker_instance = MLflowTracker(
-    tracking_uri=settings.mlflow_tracking_uri,
-    experiment_name=settings.mlflow_experiment_name
-)
+from fastapi import Request
 
-def get_experiment_tracker():
-    """FastAPI dependency provider."""
-    return _tracker_instance
+from ..core.queue_manager import QueueManager
+
+
+def get_queue_manager(request: Request) -> QueueManager:
+    return request.app.state.queue_manager

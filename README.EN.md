@@ -1,216 +1,96 @@
-<div align="center">
+# Scientific API Gateway
 
-# 🔬 Scientific API Gateway
+[Русский](README.md) · Python 3.12+ · [MIT](LICENSE)
 
-**A high-performance, strongly typed API framework for computational physics and scientific machine learning**
+`scientific-api` is a scientific service example built with FastAPI: an independent NumPy computational core, strict contracts, background jobs, and persisted artifacts. Version 0.3.0 makes reproducibility and result validation part of the workflow.
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![Pydantic](https://img.shields.io/badge/Pydantic-v2-E92063?style=flat-square)](https://docs.pydantic.dev/)
-[![Ruff](https://img.shields.io/badge/Linter-Ruff-261230?style=flat-square)](https://docs.astral.sh/ruff/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+The `ideal-gas-ou-v1` model describes two-dimensional velocities of independent particles coupled to an Ornstein–Uhlenbeck thermostat. It uses **dimensionless reduced units** with `m = k_B = 1` and friction `γ = 1`. This is an educational stochastic dynamics model; its inputs do not represent Kelvin or femtoseconds.
 
-</div>
+## Quick start
 
----
-
-## 🎯 Why is this necessary?
-
-Most scientific APIs are built as fragile wrappers around Jupyter Notebooks. They do not have strict data validation, they crash with `malformed` input (distorted data) and cannot be reproducibly deployed on HPC clusters or cloud infrastructure.
-
-This template solves this problem by imposing **Domain-Driven Design (DDD)** and **Strong typing** at the architecture level:
-
-| Principle | Description |
-|---------|----------|
-| 🔒 **Default reproducibility** | Each request is strictly validated via Pydantic v2 (`strict=True`). A string cannot be implicitly converted to a floating-point number. Physical constraints (for example, `T>0`) are enforced at the API boundary. |
-| 🏗️ **Separation of areas of responsibility** | Scientific algorithms (`models/`) they don't know anything about HTTP. They can be tested in isolation, exported as CLI utilities, or used in simulations for an article without changing a single line of code. |
-| 🚀 **Modern Python (2025+)** | No legacy ballast. Built on PEP 621, controlled via `uv`, typed via `pyright`, formatted via `ruff'. |
-
----
-
-## 🏛️ Architecture Overview
-
-``
-Client Request
-
-
-[API Layer - FastAPI] ──► Strict Pydantic validation
-         │
-         ▼
-[Service Layer] ──────► Business Logic, experiment Tracking (MLflow/W&B)
-
-
-[Scientific Core] ─────► Pure NumPy/JAX/C++ Computing (Stateless)
-``
-
----
-
-## 🚀 Quick Start
-
-> **Requires an installed [uv] (https://docs.astral.sh/uv /)** is the fastest Python package manager.
+Install Python 3.12+ and [uv](https://docs.astral.sh/uv/). In a cloud task, use the existing isolated checkout; an additional Git worktree is unnecessary.
 
 ```bash
-# Cloning the repository
-git clone https://github.com/Artem7898/scientific_fastapi
-cd scientific-fastapi
-
-# Creating a virtual environment and installing dependencies
-uv venv
-source .venv/bin/activate # Windows: .venv\Scripts\activate
-uv pip install -e ".[dev]"
-
-# Running strict type checking and linting
-ruff check .
-pyright src/
-
-# Running tests
-pytest
-
-# Launching
-the uvicorn src API server.scientific_api.main:app --reload
+git clone https://github.com/Artem7898/scientific_fastapi.git
+cd scientific_fastapi
+uv sync --frozen
+uv run --frozen uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
 ```
 
-, Go to `http://localhost:8000/redoc ` for the interactive API specification.
+OpenAPI is available at `http://localhost:8000/docs`, ReDoc at `/redoc`. Health endpoints are `/health/live` and `/health/ready`.
 
----
+Submit a job:
 
-## , Documentation
-
-- [Architecture and Design Solutions](docs/architecture.md) — ADR (Architecture Decision Records)
-- [API Reference](docs/api-reference.md) — Complete endpoint documentation
-- [Development Guide](docs/development.md) — Standards for code and testing
-
----
-
-## 🧪 Usage example
-
-### Running a Monte Carlo simulation
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/api/v1/simulations/monte-carlo",
-    json={
-        "initial_temperature": 300.0,  # K
-        "num_particles": 1000,
-        "time_step": 0.001  # fs
-    }
-)
-
-result = response.json()
-print(f"Task ID: {result['task_id']}")
-print(f"Final Temperature: {result['final_temperature']} K")
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_temperature":300.0,"num_particles":1000,"time_step":0.001,"num_steps":100,"seed":42}'
 ```
 
----
-
-## 📋 API Reference (v1)
-
-**Base URL:** `http://localhost:8000/api/v1`
-
-### Running the simulation
-
-Performs a simulation of stochastic dynamics based on approximations of an ideal gas.
-
-**Endpoint:** `POST /simulations/monte-carlo`  
-**Content-Type:** `application/json`
-
-#### Request Body parameters
-
-| Parameter | Type | Restrictions | Description |
-|----------|-----|-------------|----------|
-| `initial_temperature` | float | > 0.0, <= 1 000 000 | The initial temperature of the system in Kelvin (K) |
-| `num_particles` | integer | > 0, <= 1 000 000 | Number of particles in the simulation volume (N) |
-| `time_step` | float | > 0.0 | The integration step is in femtoseconds (fs). The default value is 0.001 |
-
-#### Response scheme (200 OK)
+The service responds with `202 Accepted`:
 
 ```json
 {
-  "task_id": "a1b2c3d4...",
-  "final_temperature": 298.4521,
-  "total_energy": 1245.887,
-  "status": "completed"
+  "task_id": "a1b2c3d4",
+  "status": "pending",
+  "check_url": "/api/v1/simulations/status/a1b2c3d4"
 }
 ```
 
-#### Error codes
+Poll `check_url`. The same `task_id` passes through `pending`, `running`, and `completed` or `failed`/`cancelled`. A completed response includes temperature, energy, temperature standard error, model version, seed, and artifact references. See the [API reference](docs/api_reference.md) for the complete contract and limits.
 
-| Code | Description |
-|-----|----------|
-| `422 Unprocessable Entity` | Violated physical restrictions or incorrect JSON types |
-| `500 Internal Server Error` | Numerical instability (e.g. NaN overflow) in the computing core |
+## Reproducibility
 
----
+- Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
+- The API saves a run manifest and `final_state.npz` in `ARTIFACTS_DIR/<task_id>/<attempt_id>/`. `task_id` stays stable; `attempt_id` distinguishes execution attempts during queue recovery. The result references the committed attempt. The manifest records inputs, model, results, environment versions, and the commit when available.
+- `uv.lock` fixes resolved dependencies; `uv sync --frozen` installs without regenerating the lockfile. A `pylock.toml` export supports tools implementing PEP 751.
+- Tests check repeatability in a fixed environment, analytical properties of the model, the API contract, and research artifact generation.
 
-## 🏗️ Project structure
+A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of independent particles in this model; it does not include physical model error or measurement uncertainty.
 
-````
-scientific_fastapi/
-├── pyproject.toml                    # Metadata, dependencies (PEP 621)
-├── Dockerfile                        # Multi-stage build for minimal image
-├── src/
-│   └── scientific_api/
-│       ├── __init__.py
-│       ├── main.py                    # Entry point, lifespan, middleware
-│       ├── api/
-│       │   ├── __init__.py
-│       │   ├── v1/
-│       │   │   ├── __init__.py
-│       │   │   └── endpoints/
-│       │   │   ├──__init__.py ,
-|       |   |   |── simulations.py      # Routers
-│       │   └── dependencies.py         # Shared Dependencies (DI)
-│       ├── schemas/                    # Pydantic models (contracts)
-│       │   ├──__init__.py ,
-|       |   |── simulation.py ,
-|       |── services/                   # Business logic
-│       │   ├── __init__.py
-│       │   └── simulation_service.py
-|       |── core/                        # Settings, logging
-│       │   ├── __init__.py
-│       │   ├── config.py               # Pydantic Settings
-│       │   └── logging.py
-│       └── models/                     # Pure Science (NumPy/JAX/PyTorch)
-│           ├──__init__.py
-|           |── physics_engine.py ,
-|── tests/
-    |──__init__.py ,
-    |── conftest.py                   # Fixtures for pytest
-    └── api/
-        └── test_simulations.py       # API Tests (httpx.AsyncClient)
+## Optional dependencies
+
+The minimal installation runs the API and NumPy model. Install integrations explicitly:
+
+| Extra | Purpose |
+| --- | --- |
+| `dev` | pytest, Ruff, Pyright, package validation tools |
+| `redis` | Redis status storage and queue |
+| `tracking` | MLflow adapter |
+| `research` | research figures |
+| `notebooks` | Jupyter and notebook tooling |
+| `observability` | OpenTelemetry and telemetry export |
+| `benchmark` | additional computational backends for comparisons |
+
+For example: `uv sync --frozen --extra redis --extra observability`. Redis, MLflow, and OpenTelemetry adapters load when their integration is enabled. An empty `MLFLOW_TRACKING_URI` disables tracking.
+
+## Execution and telemetry
+
+The default bounded in-memory queue supports local development in one process. Jobs and statuses are lost on restart, and independent processes do not share state. Enable `REDIS_URI` for shared state; acknowledgment, retries, and retention are described in the [architecture guide](docs/architecture.md).
+
+Use one Uvicorn worker with the in-memory queue. Multiple machines also need shared artifact storage: Redis does not share local files.
+
+After installing `observability`, set `OTEL_ENABLED=true` to connect HTTP requests, queue waiting, and calculations in traces. Metrics describe queue waiting, execution duration, and errors. Exporter configuration is covered in the [development guide](docs/development.md).
+
+## Development
+
+```bash
+uv sync --frozen --extra dev --extra research --extra redis --extra observability
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
+uv run --no-sync pyright src/
+uv run --no-sync pytest
 ```
 
+CI installs from the lockfile and checks code, reproducibility, and the built package. The [development guide](docs/development.md) covers research artifacts, benchmarking, builds, and PEP 751 export. Benchmarks use a fixed workload and report warmup separately. Measure process, Numba, JAX, and free-threaded Python performance on the target machine before claiming a speedup.
 
+## Documentation and citation
 
- 🔧 Requirements
+- [Architecture and limitations](docs/architecture.md)
+- [API reference](docs/api_reference.md)
+- [Development, artifacts, and benchmarks](docs/development.md)
+- [Citation metadata](CITATION.cff)
 
-- **Python:** 3.12+
-- **Package Manager:** [uv](https://docs.astral.sh/uv/)
-- **Linter:** Ruff
-- **Type Checker:** Pyright
-- **Testing:** pytest
+Author: Artem Alimpiev · [ORCID](https://orcid.org/0009-0007-6740-7242) · [Zenodo](https://doi.org/10.5281/zenodo.20057106).
 
----
-
- 🤝 Contribution to the project
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature')
-3. Commit the changes (`git commit -m 'Add amazing feature')
-4. Send to the branch ('git push origin feature/amazing-feature')
-5. Open the Pull Request
-
----
-  The Author of the project is Artem Alimpiev
- https://orcid.org/0009-0007-6740-7242
- https://doi.org/10.5281/zenodo.20057106
- 📄 License
-
-Distributed under the MIT license. See [LICENSE](LICENSE) for details.
-
----
-
-
-
+Licensed under [MIT](LICENSE).

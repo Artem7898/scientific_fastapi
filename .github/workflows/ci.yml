@@ -1,0 +1,193 @@
+name: Validate scientific API
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      optional_benchmarks:
+        description: Run Numba/JAX and free-threaded Python benchmark experiments
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      SCIENTIFIC_TEST_REDIS_URI: redis://127.0.0.1:6379/15
+    services:
+      redis:
+        image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.23"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install reviewed dependency resolution
+        run: uv sync --frozen --extra dev --extra redis --extra tracking --extra research --extra observability
+      - name: Confirm lockfile matches package metadata
+        run: uv lock --check
+      - name: Lint and type check
+        run: |
+          uv run --frozen --no-sync ruff check .
+          uv run --frozen --no-sync pyright
+      - name: Test scientific, API and artifact contracts
+        run: uv run --frozen --no-sync pytest
+      - name: Regenerate a small research run
+        run: uv run --frozen --no-sync python scripts/run_paper_pipeline.py --output-dir /tmp/paper-smoke --seed 42 --num-points 3 --num-particles 48 --num-steps 5
+      - name: Check benchmark backends produce equivalent results
+        run: uv run --frozen --no-sync python scripts/benchmark.py --particles 64 --steps 4 --repeats 2 --workers 2 --backends numpy,threads,processes --output /tmp/benchmark-smoke.json
+      - name: Export a portable PEP 751 lock
+        run: uv export --frozen --format pylock.toml --no-editable --no-emit-project --output-file /tmp/pylock.toml
+      - name: Build distributions with the pinned backend
+        run: uv build
+      - name: Import installed wheel outside checkout
+        shell: bash
+        run: |
+          uv venv --python "${{ matrix.python }}" /tmp/scientific-wheel
+          uv export --frozen --no-emit-project --output-file /tmp/scientific-core.txt
+          uv pip install --python /tmp/scientific-wheel/bin/python --require-hashes -r /tmp/scientific-core.txt
+          uv pip install --python /tmp/scientific-wheel/bin/python --no-deps dist/*.whl
+          cd /tmp
+          /tmp/scientific-wheel/bin/python -I -c "import scientific_api; from scientific_api.main import app; assert scientific_api.__version__ == '0.3.0'; assert app is not None"
+      - name: Ensure frozen operations preserved the lock
+        run: git diff --exit-code -- uv.lock
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the default API and Redis stack
+        run: docker compose up --build --detach --wait --wait-timeout 180
+      - name: Submit a task, poll its state and download its manifest
+        run: |
+          python - <<'PYTHON'
+          import hashlib
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          base = "http://127.0.0.1:8000"
+          invalid = urllib.request.Request(
+              base + "/api/v1/simulations/monte-carlo",
+              data=b'{"initial_temperature":300.0,"num_particles":24,"time_step":1e309}',
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urllib.request.urlopen(invalid, timeout=5)
+              raise AssertionError("Nonfinite input was accepted")
+          except urllib.error.HTTPError as error:
+              assert error.code == 422
+              assert isinstance(json.load(error)["detail"], list)
+          payload = {"initial_temperature": 300.0, "num_particles": 24, "num_steps": 3, "seed": 42}
+          request = urllib.request.Request(
+              base + "/api/v1/simulations/monte-carlo",
+              data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              accepted = json.load(response)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              with urllib.request.urlopen(base + accepted["check_url"], timeout=5) as response:
+                  result = json.load(response)
+              if result["status"] == "completed":
+                  break
+              assert result["status"] in {"pending", "running"}, result
+              time.sleep(0.1)
+          else:
+              raise AssertionError("Container task did not finish")
+          assert result["task_id"] == accepted["task_id"]
+          prefix = result["task_id"] + "/" + result["attempt_id"] + "/"
+          assert all(path.startswith(prefix) for path in result["artifacts"].values())
+          artifact = base + "/api/v1/simulations/" + accepted["task_id"] + "/artifacts/"
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              manifest = json.load(response)
+          with urllib.request.urlopen(artifact + "final_state", timeout=5) as response:
+              digest = hashlib.sha256(response.read()).hexdigest()
+          assert digest == manifest["artifacts"][0]["sha256"]
+          with open("/tmp/container-task.json", "w") as stream:
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest}, stream)
+          print("Container validation, task, attempt isolation and artifact hash passed")
+          PYTHON
+      - name: Verify task state and artifacts survive API and Redis restart
+        run: |
+          docker compose restart redis api
+          docker compose up --detach --no-build --wait --wait-timeout 120
+          python - <<'PYTHON'
+          import hashlib
+          import json
+          import urllib.request
+
+          with open("/tmp/container-task.json") as stream:
+              expected = json.load(stream)
+          base = "http://127.0.0.1:8000/api/v1/simulations/"
+          with urllib.request.urlopen(base + "status/" + expected["task_id"], timeout=5) as response:
+              result = json.load(response)
+          assert result["status"] == "completed"
+          assert result["attempt_id"] == expected["attempt_id"]
+          with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/final_state", timeout=5) as response:
+              assert hashlib.sha256(response.read()).hexdigest() == expected["sha256"]
+          print("Persisted Redis state and artifact volume survived restart")
+          PYTHON
+      - name: Show container logs after failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove CI containers and generated volumes
+        if: always()
+        run: docker compose down --volumes
+
+  optional-benchmarks:
+    if: github.event_name == 'workflow_dispatch' && inputs.optional_benchmarks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.14"
+            experimental: false
+          - python: "3.14t"
+            experimental: true
+    # Free-threaded compatibility remains informative until all backend wheels exist.
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.23"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Measure core backends
+        run: |
+          uv sync --frozen
+          uv run --frozen --no-sync python scripts/benchmark.py --particles 256 --steps 10 --repeats 3 --workers 2 --backends numpy,threads,processes --output /tmp/benchmark-core.json
+      - name: Measure optional JIT backends where supported
+        run: |
+          uv sync --frozen --extra benchmark
+          uv run --frozen --no-sync python scripts/benchmark.py --particles 256 --steps 10 --repeats 3 --workers 2 --backends numpy,numba,jax --output /tmp/benchmark-jit.json
+          uv run --frozen --no-sync python -c "import json; report = json.load(open('/tmp/benchmark-jit.json')); assert all(report['backends'][name]['status'] == 'passed' for name in ('numpy', 'numba', 'jax')), report"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-${{ matrix.python }}
+          path: /tmp/benchmark-*.json

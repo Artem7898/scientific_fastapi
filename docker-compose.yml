@@ -1,72 +1,94 @@
-version: "3.9"
-
 services:
   api:
     build: .
-    container_name: sci_api
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       mlflow:
-        condition: service_started
+        condition: service_healthy
+        required: false
     environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - REDIS_HOST=redis
-    expose:
-      - "8000"
+      REDIS_URI: redis://redis:6379/0
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
+      MLFLOW_EXPERIMENT_NAME: computational_physics
+      ARTIFACTS_DIR: /data/runs
+      MAX_QUEUE_SIZE: "100"
+      WORKER_COUNT: "2"
+      TASK_TTL_SECONDS: "3600"
+      MAX_SIMULATION_ITERATIONS: "10000"
+      MAX_PARTICLE_STEPS: "100000000"
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - run_artifacts:/data/runs
     networks:
       - backend
 
   nginx:
-    image: nginx:alpine
-    container_name: sci_nginx
+    profiles: ["proxy"]
+    image: nginx:stable-alpine@sha256:970364228b1e4f932abc22d321932816782cca8a20b85a77552a7cfe9acfb3b5
     ports:
-      - "80:80"
+      - "127.0.0.1:8080:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - backend
 
   redis:
-    image: redis:7-alpine
-    container_name: sci_redis
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
+      timeout: 3s
       retries: 5
     networks:
       - backend
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.17.0
-    container_name: sci_mlflow
+    profiles: ["tracking"]
+    # Keep this server version aligned with the client resolved in uv.lock.
+    image: ghcr.io/mlflow/mlflow:v3.17.1@sha256:65aa7a75fe37554bd7dd9e539b58e1ec130dac99f27fef9756df316a272dfee2
     restart: unless-stopped
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --backend-store-uri sqlite:///mlflow.db
-      --default-artifact-root /mlflow/artifacts
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --artifacts-destination
+      - /mlflow/artifacts
+      - --allowed-hosts
+      - mlflow:5000,localhost:5000,127.0.0.1:5000
+    ports:
+      - "127.0.0.1:5000:5000"
     volumes:
       - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
     networks:
       - backend
 
 networks:
   backend:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.30.0.0/16   # 💥 фикс твоей ошибки с сетями
 
 volumes:
   redis_data:
   mlflow_data:
+  run_artifacts:

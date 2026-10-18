@@ -1,222 +1,96 @@
-<div align="center">
+# Scientific API Gateway
 
-# 🔬 Scientific API Gateway
+[English](README.EN.md) · Python 3.12+ · [MIT](LICENSE)
 
-**Высокопроизводительный, строго типизированный API-фреймворк для вычислительной физики и научного машинного обучения**
+`scientific-api` — пример научного сервиса на FastAPI: независимое вычислительное ядро NumPy, строгие контракты, фоновые задания и сохраняемые артефакты. Версия 0.3.0 делает воспроизводимость и проверку результатов частью рабочего процесса.
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![Pydantic](https://img.shields.io/badge/Pydantic-v2-E92063?style=flat-square)](https://docs.pydantic.dev/)
-[![Ruff](https://img.shields.io/badge/Linter-Ruff-261230?style=flat-square)](https://docs.astral.sh/ruff/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+Модель `ideal-gas-ou-v1` описывает двумерные скорости независимых частиц с термостатом Орнштейна — Уленбека. Используются **безразмерные приведённые единицы** с `m = k_B = 1` и коэффициентом трения `γ = 1`. Это учебная модель стохастической динамики; её нельзя интерпретировать как молекулярную динамику с температурами в Кельвинах и временем в фемтосекундах.
 
-</div>
+## Быстрый старт
 
----
-
-## 🎯 Зачем это нужно?
-
-Большинство научных API строятся как хрупкие обертки вокруг Jupyter Notebooks. В них нет строгой валидации данных, они падают при `malformed`-вводе (искаженных данных) и их невозможно воспроизводимо развернуть на HPC-кластерах или облачной инфраструктуре.
-
-Этот шаблон решает эту проблему, навязывая **Domain-Driven Design (DDD)** и **Строгую типизацию** на уровне архитектуры:
-
-| Принцип | Описание |
-|---------|----------|
-| 🔒 **Воспроизводимость по умолчанию** | Каждый запрос строго валидируется через Pydantic v2 (`strict=True`). Строка не может быть неявно приведена к числу с плавающей точкой. Физические ограничения (например, `T>0`) enforced (принудительно выполняются) на границе API. |
-| 🏗️ **Разделение зон ответственности** | Научные алгоритмы (`models/`) ничего не знают про HTTP. Они могут тестироваться изолированно, экспортироваться как CLI-утилиты или использоваться в симуляциях для статьи без изменения единой строки кода. |
-| 🚀 **Современный Python (2025+)** | Никакого legacy-балласта. Построен на PEP 621, управляется через `uv`, типизируется через `pyright`, форматируется через `ruff`. |
-
----
-
-## 🏛️ Обзор архитектуры
-
-```
-Client Request (Запрос клиента)
-         │
-         ▼
-[API Layer - FastAPI] ──► Строгая валидация Pydantic
-         │
-         ▼
-[Service Layer] ───────► Бизнес-логика, трекинг экспериментов (MLflow/W&B)
-         │
-         ▼
-[Scientific Core] ─────► Чистые вычисления NumPy/JAX/C++ (Stateless / без состояния)
-```
-
----
-
-## 🚀 Быстрый старт
-
-> **Требуется установленный [uv](https://docs.astral.sh/uv/)** — самый быстрый пакетный менеджер Python.
+Требуются Python 3.12+ и [uv](https://docs.astral.sh/uv/). В облачной задаче используйте уже существующий изолированный checkout; дополнительный Git worktree не нужен.
 
 ```bash
-# Клонирование репозитория
-git clone https://github.com/Artem7898/scientific_fastapi
-cd scientific-fastapi
-
-# Создание виртуального окружения и установка зависимостей
-uv venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-uv pip install -e ".[dev]"
-
-# Запуск строгой проверки типов и линтинга
-ruff check .
-pyright src/
-
-# Запуск тестов
-pytest
-
-# Запуск API-сервера
-uvicorn src.scientific_api.main:app --reload
+git clone https://github.com/Artem7898/scientific_fastapi.git
+cd scientific_fastapi
+uv sync --frozen
+uv run --frozen uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
 ```
 
-📚 Перейдите по адресу `http://localhost:8000/redoc` для интерактивной спецификации API.
+OpenAPI доступен по `http://localhost:8000/docs`, ReDoc — по `/redoc`. Проверки состояния: `/health/live` и `/health/ready`.
 
----
+Отправьте задание:
 
-## 📖 Документация
-
-- [Архитектура и проектные решения](docs/architecture.md) — ADR (Architecture Decision Records)
-- [Справочник API](docs/api-reference.md) — Полная документация эндпоинтов
-- [Руководство по разработке](docs/development.md) — Стандарты кода и тестирования
-
----
-
-## 🧪 Пример использования
-
-### Запуск симуляции Монте-Карло
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/api/v1/simulations/monte-carlo",
-    json={
-        "initial_temperature": 300.0,  # K
-        "num_particles": 1000,
-        "time_step": 0.001  # fs
-    }
-)
-
-result = response.json()
-print(f"Task ID: {result['task_id']}")
-print(f"Final Temperature: {result['final_temperature']} K")
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_temperature":300.0,"num_particles":1000,"time_step":0.001,"num_steps":100,"seed":42}'
 ```
 
----
-
-## 📋 Справочник API (v1)
-
-**Base URL:** `http://localhost:8000/api/v1`
-
-### Запуск симуляции
-
-Выполняет симуляцию стохастической динамики на основе приближений идеального газа.
-
-**Эндпоинт:** `POST /simulations/monte-carlo`  
-**Content-Type:** `application/json`
-
-#### Параметры тела запроса
-
-| Параметр | Тип | Ограничения | Описание |
-|----------|-----|-------------|----------|
-| `initial_temperature` | float | > 0.0, <= 1 000 000 | Начальная температура системы в Кельвинах (K) |
-| `num_particles` | integer | > 0, <= 1 000 000 | Количество частиц в объеме симуляции (N) |
-| `time_step` | float | > 0.0 | Шаг интегрирования в фемтосекундах (fs). По умолчанию 0.001 |
-
-#### Схема ответа (200 OK)
+Сервис отвечает `202 Accepted`:
 
 ```json
 {
-  "task_id": "a1b2c3d4...",
-  "final_temperature": 298.4521,
-  "total_energy": 1245.887,
-  "status": "completed"
+  "task_id": "a1b2c3d4",
+  "status": "pending",
+  "check_url": "/api/v1/simulations/status/a1b2c3d4"
 }
 ```
 
-#### Коды ошибок
+Опросите `check_url`. Один и тот же `task_id` проходит состояния `pending`, `running` и `completed` либо `failed`/`cancelled`. Результат включает оценку температуры, энергию, стандартную ошибку температуры, версию модели, seed и ссылки на артефакты. Полный контракт и ограничения — в [справочнике API](docs/api_reference.md).
 
-| Код | Описание |
-|-----|----------|
-| `422 Unprocessable Entity` | Нарушены физические ограничения или неверные типы JSON |
-| `500 Internal Server Error` | Численная нестабильность (например, переполнение NaN) в вычислительном ядре |
+## Что обеспечивает воспроизводимость
 
----
+- Каждый расчёт использует собственный `numpy.random.Generator` с явным seed и алгоритмом PCG64; число шагов входит в запрос.
+- API сохраняет manifest и конечное состояние `final_state.npz` в `ARTIFACTS_DIR/<task_id>/<attempt_id>/`. `task_id` постоянен, а `attempt_id` различает попытки исполнения при восстановлении очереди; результат ссылается на подтверждённую попытку. Manifest связывает параметры, модель, результаты, версии окружения и commit, когда он доступен.
+- `uv.lock` фиксирует разрешённые зависимости; `uv sync --frozen` устанавливает их без пересоздания lockfile. Для обмена с инструментами, поддерживающими PEP 751, доступен экспорт `pylock.toml`.
+- Тесты проверяют повторяемость при одинаковых параметрах и окружении, аналитические свойства модели, контракт API и построение исследовательских артефактов.
 
-## 🏗️ Структура проекта
+Одинаковый seed гарантирует повторение в фиксированном программном и аппаратном окружении. Побитовое совпадение между версиями NumPy, платформами и разными вычислительными backend не обещается. Стандартная ошибка `T / sqrt(N)` относится к конечному снимку независимых частиц в данной модели; она не учитывает погрешность другой физической модели или экспериментальных измерений.
 
-```
-scientific_fastapi/
-├── pyproject.toml          # Метаданные, зависимости (PEP 621)
-├── Dockerfile              # Multi-stage build для минимального образа
-├── src/
-│   └── scientific_api/
-│       ├── __init__.py
-│       ├── main.py         # Точка входа, lifespan, middleware
-│       ├── api/
-│       │   ├── __init__.py
-│       │   ├── v1/
-│       │   │   ├── __init__.py
-│       │   │   └── endpoints/
-│       │   │       ├── __init__.py
-│       │   │       └── simulations.py  # Роутеры
-│       │   └── dependencies.py         # Общие зависимости (DI)
-│       ├── schemas/                    # Pydantic модели (контракты)
-│       │   ├── __init__.py
-│       │   └── simulation.py
-│       ├── services/                   # Бизнес-логика
-│       │   ├── __init__.py
-│       │   └── simulation_service.py
-│       ├── core/                       # Настройки, логирование
-│       │   ├── __init__.py
-│       │   ├── config.py               # Pydantic Settings
-│       │   └── logging.py
-│       └── models/                     # Чистая наука (NumPy/JAX/PyTorch)
-│           ├── __init__.py
-│           └── physics_engine.py
-└── tests/
-    ├── __init__.py
-    ├── conftest.py                     # Фикстуры для pytest
-    └── api/
-        └── test_simulations.py         # Тесты API (httpx.AsyncClient)
+## Зависимости по назначению
+
+Минимальная установка запускает API и NumPy-модель. Дополнительные зависимости устанавливаются явно:
+
+| Extra | Назначение |
+| --- | --- |
+| `dev` | pytest, Ruff, Pyright и инструменты проверки пакета |
+| `redis` | постоянное хранение статусов и очередь Redis |
+| `tracking` | адаптер MLflow |
+| `research` | построение исследовательских графиков |
+| `notebooks` | Jupyter и инструменты notebook |
+| `observability` | OpenTelemetry и экспорт телеметрии |
+| `benchmark` | дополнительные вычислительные backend для сравнений |
+
+Например, `uv sync --frozen --extra redis --extra observability`. Адаптеры Redis, MLflow и OpenTelemetry загружаются при включении соответствующей функции. Пустой `MLFLOW_TRACKING_URI` отключает tracking.
+
+## Исполнение и наблюдаемость
+
+По умолчанию используется ограниченная очередь в памяти одного процесса. Этот режим удобен для локальной разработки: принятые задания и статусы не переживают перезапуск, а несколько независимых процессов не разделяют данные. Для общего состояния включите `REDIS_URI`; особенности подтверждений, повторов и хранения описаны в [архитектуре](docs/architecture.md).
+
+Не включайте несколько Uvicorn workers с очередью в памяти. Локальные файлы артефактов также требуют общего хранилища при запуске на нескольких машинах. Redis не превращает локальный каталог в общее файловое хранилище.
+
+OpenTelemetry включается через `OTEL_ENABLED=true` после установки extra `observability`. Трассировка связывает HTTP-запрос, ожидание задания и вычисление; метрики отражают ожидание, длительность и ошибки. Настройки экспортёра и остальные переменные — в [руководстве по разработке](docs/development.md).
+
+## Разработка и проверка
+
+```bash
+uv sync --frozen --extra dev --extra research --extra redis --extra observability
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
+uv run --no-sync pyright src/
+uv run --no-sync pytest
 ```
 
+CI устанавливает зависимости из lockfile, проверяет код, воспроизводимость и собранный пакет. [Руководство по разработке](docs/development.md) содержит команды исследовательского пайплайна, benchmark, сборки и экспорта PEP 751. Benchmark измеряет конкретную нагрузку и отдельно учитывает прогрев; ускорение от процессов, Numba, JAX или Python без GIL следует подтверждать измерениями на целевой машине.
 
+## Документация и цитирование
 
-## 🔧 Требования
+- [Архитектура и ограничения](docs/architecture.md)
+- [Справочник API](docs/api_reference.md)
+- [Разработка, артефакты и benchmark](docs/development.md)
+- [Метаданные цитирования](CITATION.cff)
 
-- **Python:** 3.12+
-- **Пакетный менеджер:** [uv](https://docs.astral.sh/uv/)
-- **Линтер:** Ruff
-- **Type Checker:** Pyright
-- **Тестирование:** pytest
+Автор: Артем Алимпиев · [ORCID](https://orcid.org/0009-0007-6740-7242) · [Zenodo](https://doi.org/10.5281/zenodo.20057106).
 
----
-
-## 🤝 Вклад в проект
-
-1. Форкните репозиторий
-2. Создайте feature-ветку (`git checkout -b feature/amazing-feature`)
-3. Зафиксируйте изменения (`git commit -m 'Add amazing feature'`)
-4. Отправьте в ветку (`git push origin feature/amazing-feature`)
-5. Откройте Pull Request
-
----
-Автор проекта: Артем Алимпиев
-#### https://orcid.org/0009-0007-6740-7242
-#### https://doi.org/10.5281/zenodo.20057106
-
-## 📄 Лицензия
-
-Распространяется под лицензией MIT. См. [LICENSE](LICENSE) для подробностей.
-
----
-
-<div align="center">
-
-**[⬆ Наверх](#-scientific-api-gateway)**
-
-Made with 🔬 for Science
-
-</div>
+Проект распространяется под [лицензией MIT](LICENSE).
