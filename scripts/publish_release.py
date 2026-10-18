@@ -20,12 +20,15 @@ from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 STABLE_VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 
 
-def run(*args: str, binary: bool = False) -> Any:
-    return subprocess.run(args, check=True, capture_output=True, text=not binary).stdout
+def run(*args: str, binary: bool = False, input_data: str | None = None) -> Any:
+    return subprocess.run(
+        args, check=True, capture_output=True, text=not binary, input=input_data
+    ).stdout
 
 
 def api(repository: str, path: str, *, missing_ok: bool = False) -> Any:
@@ -35,6 +38,21 @@ def api(repository: str, path: str, *, missing_ok: bool = False) -> Any:
         if missing_ok and "HTTP 404" in str(error.stderr):
             return None
         raise
+
+
+def write_api(repository: str, path: str, method: str, payload: dict[str, Any]) -> Any:
+    return json.loads(
+        run(
+            "gh",
+            "api",
+            f"repos/{repository}/{path}",
+            "--method",
+            method,
+            "--input",
+            "-",
+            input_data=json.dumps(payload),
+        )
+    )
 
 
 def source_version(source: str) -> str:
@@ -123,16 +141,24 @@ def tag_sha(release: Release) -> str | None:
 
 
 def release_state(release: Release) -> dict[str, Any] | None:
-    pages = json.loads(
-        run(
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{release.repository}/releases?per_page=100",
-        )
+    output = run(
+        "gh",
+        "api",
+        "--paginate",
+        f"repos/{release.repository}/releases?per_page=100",
     )
-    releases = [item for page in pages for item in page]
+    # Older gh versions emit one JSON array per page without a surrounding array.
+    decoder = json.JSONDecoder()
+    position = 0
+    releases = []
+    while position < len(output):
+        if output[position].isspace():
+            position += 1
+            continue
+        page, position = decoder.raw_decode(output, position)
+        if not isinstance(page, list):
+            raise ValueError("Expected a release list on every GitHub API page")
+        releases.extend(page)
     version_tuple = tuple(map(int, release.version.split(".")))
     for item in releases:
         previous = STABLE_VERSION.fullmatch(item["tag_name"].removeprefix("v"))
@@ -214,48 +240,96 @@ def publish(release: Release, *, check_only: bool = False) -> None:
         return
     files = artifacts(release)
     if existing is None:
-        run(
-            "gh",
-            "release",
-            "create",
-            release.tag,
-            "--repo",
+        # Keep the returned resource ID instead of rediscovering the draft in the index.
+        existing = write_api(
             release.repository,
-            "--target",
-            release.sha,
-            "--draft",
-            "--title",
-            f"Scientific API Gateway {release.tag}",
-            "--notes-file",
-            str(release.notes),
+            "releases",
+            "POST",
+            {
+                "tag_name": release.tag,
+                "target_commitish": release.sha,
+                "name": f"Scientific API Gateway {release.tag}",
+                "body": release.notes.read_text(),
+                "draft": True,
+                "prerelease": False,
+            },
         )
-        existing = release_state(release)
-        if existing is None or not existing["draft"]:
-            raise ValueError("Expected a draft before uploading assets")
+    validate_draft(release, existing)
     uploaded = verify_assets(release, existing, files)
-    missing = [str(path) for path in files if path.name not in uploaded]
-    if missing:
-        run("gh", "release", "upload", release.tag, *missing, "--repo", release.repository)
+    for path in files:
+        if path.name in uploaded:
+            continue
+        asset = json.loads(
+            run(
+                "gh",
+                "api",
+                f"https://uploads.github.com/repos/{release.repository}/releases/"
+                f"{existing['id']}/assets?name={quote(path.name, safe='')}",
+                "--method",
+                "POST",
+                "-H",
+                "Content-Type: application/octet-stream",
+                "--input",
+                str(path),
+            )
+        )
+        if asset.get("name") != path.name or not isinstance(asset.get("id"), int):
+            raise ValueError("Upload response does not identify the expected asset")
     existing = api(release.repository, f"releases/{existing['id']}")
-    if not existing["draft"] or verify_assets(release, existing, files) != {p.name for p in files}:
+    validate_draft(release, existing)
+    if verify_assets(release, existing, files) != {p.name for p in files}:
         raise ValueError("All draft assets must be verified before publication")
     guard_main(release)
-    state = release_state(release)
-    if state is None or not state["draft"] or state["id"] != existing["id"]:
-        raise ValueError("Draft changed before publication")
-    run(
-        "gh",
-        "release",
-        "edit",
-        release.tag,
-        "--repo",
+    target = tag_sha(release)
+    if target is not None and target != release.sha:
+        raise ValueError("Tag changed before publication; refusing to move it")
+    state = api(release.repository, f"releases/{existing['id']}")
+    validate_draft(release, state)
+    result = write_api(
         release.repository,
-        "--draft=false",
-        "--latest",
+        f"releases/{existing['id']}",
+        "PATCH",
+        {"draft": False, "make_latest": "true"},
     )
+    if (
+        result.get("id") != existing["id"]
+        or result.get("tag_name") != release.tag
+        or result.get("draft") is not False
+        or result.get("target_commitish") != release.sha
+    ):
+        raise ValueError("Publication response does not identify the expected release")
     if tag_sha(release) != release.sha:
         raise ValueError("Published tag does not resolve to the tested commit")
     print(f"Published https://github.com/{release.repository}/releases/tag/{release.tag}")
+
+
+def validate_draft(release: Release, state: dict[str, Any]) -> None:
+    if (
+        not isinstance(state.get("id"), int)
+        or state.get("draft") is not True
+        or state.get("tag_name") != release.tag
+        or state.get("target_commitish") != release.sha
+    ):
+        raise ValueError("Release response must identify the requested draft and commit")
+
+
+def failure_reason(error: Exception) -> str:
+    message = str(error)
+    if (
+        isinstance(error, subprocess.CalledProcessError)
+        and isinstance(error.cmd, (tuple, list))
+        and error.cmd
+        and error.cmd[0] == "gh"
+        and error.stderr
+    ):
+        detail = error.stderr
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        message += f"\nGitHub CLI: {detail.strip()}"
+    secrets = {os.environ.get(name, "") for name in ("GH_TOKEN", "GITHUB_TOKEN")}
+    for secret in sorted(secrets - {""}, key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    return message
 
 
 def main() -> None:
@@ -269,7 +343,7 @@ def main() -> None:
             metadata(root, os.environ.get("GITHUB_REPOSITORY", ""), args.sha), check_only=args.check
         )
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
-        raise SystemExit(f"Release stopped: {error}") from error
+        raise SystemExit(f"Release stopped: {failure_reason(error)}") from None
 
 
 if __name__ == "__main__":
