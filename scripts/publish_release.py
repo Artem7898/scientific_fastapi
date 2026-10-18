@@ -123,16 +123,24 @@ def tag_sha(release: Release) -> str | None:
 
 
 def release_state(release: Release) -> dict[str, Any] | None:
-    pages = json.loads(
-        run(
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{release.repository}/releases?per_page=100",
-        )
+    output = run(
+        "gh",
+        "api",
+        "--paginate",
+        f"repos/{release.repository}/releases?per_page=100",
     )
-    releases = [item for page in pages for item in page]
+    # Older gh versions emit one JSON array per page without a surrounding array.
+    decoder = json.JSONDecoder()
+    position = 0
+    releases = []
+    while position < len(output):
+        if output[position].isspace():
+            position += 1
+            continue
+        page, position = decoder.raw_decode(output, position)
+        if not isinstance(page, list):
+            raise ValueError("Expected a release list on every GitHub API page")
+        releases.extend(page)
     version_tuple = tuple(map(int, release.version.split(".")))
     for item in releases:
         previous = STABLE_VERSION.fullmatch(item["tag_name"].removeprefix("v"))

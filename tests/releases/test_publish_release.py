@@ -80,7 +80,8 @@ class GitHub:
             return SHA + "\n"
         if args[:2] == ("gh", "api"):
             if "--paginate" in args:
-                return json.dumps([self.other_releases + ([self.state] if self.state else [])])
+                assert "--slurp" not in args
+                return json.dumps(self.other_releases + ([self.state] if self.state else []))
             path = args[2].removeprefix(f"repos/{REPOSITORY}").removeprefix("/")
             if path == "":
                 result = {"default_branch": "main", "full_name": REPOSITORY}
@@ -170,6 +171,53 @@ def test_versions_must_agree(release):
 def test_rejects_backwards_release(release, github):
     github.other_releases = [{"tag_name": "v3.0.0", "draft": False, "prerelease": False}]
     with pytest.raises(ValueError, match="older version"):
+        publisher.publish(release)
+    assert github.mutations == []
+
+
+def test_paginated_release_arrays_check_versions_on_later_pages(release, github, monkeypatch):
+    original_run = github.run
+
+    def run(*args, **kwargs):
+        if "--paginate" in args:
+            assert "--slurp" not in args
+            first = [{"tag_name": "v1.0.0", "draft": False, "prerelease": False}]
+            second = [{"tag_name": "v3.0.0", "draft": False, "prerelease": False}]
+            return "\n " + json.dumps(first) + "\n\n" + json.dumps(second) + "\n "
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "run", run)
+    with pytest.raises(ValueError, match="older version"):
+        publisher.publish(release)
+    assert github.mutations == []
+
+
+def test_paginated_release_arrays_find_existing_release_on_later_page(release, github, monkeypatch):
+    github.draft()
+    github.state["draft"] = False
+    github.tag = OTHER_SHA
+    original_run = github.run
+
+    def run(*args, **kwargs):
+        if "--paginate" in args:
+            return "[]\n" + json.dumps([github.state])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "run", run)
+    publisher.publish(release)
+    assert github.mutations == []
+
+
+def test_paginated_release_response_rejects_non_list_page(release, github, monkeypatch):
+    original_run = github.run
+
+    def run(*args, **kwargs):
+        if "--paginate" in args:
+            return '[]\n{"message": "unexpected response"}'
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "run", run)
+    with pytest.raises(ValueError, match="release list"):
         publisher.publish(release)
     assert github.mutations == []
 
