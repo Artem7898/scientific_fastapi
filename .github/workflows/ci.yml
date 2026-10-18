@@ -62,12 +62,13 @@ jobs:
       - name: Import installed wheel outside checkout
         shell: bash
         run: |
+          expected_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           uv venv --python "${{ matrix.python }}" /tmp/scientific-wheel
           uv export --frozen --no-emit-project --output-file /tmp/scientific-core.txt
           uv pip install --python /tmp/scientific-wheel/bin/python --require-hashes -r /tmp/scientific-core.txt
           uv pip install --python /tmp/scientific-wheel/bin/python --no-deps dist/*.whl
           cd /tmp
-          /tmp/scientific-wheel/bin/python -I -c "import scientific_api; from scientific_api.main import app; assert scientific_api.__version__ == '0.3.0'; assert app is not None"
+          EXPECTED_PACKAGE_VERSION="$expected_version" /tmp/scientific-wheel/bin/python -I -c "import os, scientific_api; from scientific_api.main import app; assert scientific_api.__version__ == os.environ['EXPECTED_PACKAGE_VERSION']; assert app is not None"
       - name: Ensure frozen operations preserved the lock
         run: git diff --exit-code -- uv.lock
 
