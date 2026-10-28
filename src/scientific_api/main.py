@@ -15,7 +15,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
 from .adapters.mlflow_adapter import build_tracker
+from .api.v1.endpoints.analyses import router as analysis_router
 from .api.v1.endpoints.simulations import router as sim_router
+from .core.analysis_manager import AnalysisManager
 from .core.config import Settings
 from .core.queue_manager import QueueManager
 from .core.task_store import MemoryTaskStore, RedisTaskStore, TaskStore
@@ -91,6 +93,7 @@ def create_app(
         store: TaskStore | None = None
         manager: QueueManager | None = None
         monitoring: Telemetry | None = None
+        analyses: AnalysisManager | None = None
         try:
             if backend is not None:
                 store = backend
@@ -131,6 +134,10 @@ def create_app(
             application.state.backend = store
             application.state.telemetry = monitoring
             application.state.queue_manager = manager
+            analyses = AnalysisManager(
+                configuration.artifacts_dir, configuration.analysis_worker_count
+            )
+            application.state.analysis_manager = analyses
             await manager.start()
             yield
         finally:
@@ -139,11 +146,15 @@ def create_app(
                     await manager.stop()
             finally:
                 try:
-                    if monitoring is not None:
-                        await asyncio.to_thread(monitoring.shutdown)
+                    if analyses is not None:
+                        await analyses.stop(configuration.shutdown_timeout_seconds)
                 finally:
-                    if store is not None:
-                        await asyncio.to_thread(store.close)
+                    try:
+                        if monitoring is not None:
+                            await asyncio.to_thread(monitoring.shutdown)
+                    finally:
+                        if store is not None:
+                            await asyncio.to_thread(store.close)
 
     application = FastAPI(
         title=configuration.app_name,
@@ -155,6 +166,7 @@ def create_app(
     application.add_middleware(GZipMiddleware, minimum_size=1000)
     application.add_middleware(RequestTelemetryMiddleware)
     application.include_router(sim_router, prefix="/api/v1")
+    application.include_router(analysis_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:

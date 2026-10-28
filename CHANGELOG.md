@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Analyze committed 2D velocity snapshots without rerunning the simulation, with Gaussian component and Rayleigh speed diagnostics.
+- Generate optional PNG and three-page PDF reports, with source checksums, versioned analysis provenance, atomic artifact publication, and bounded request capacity.
+- Preserve the simulation API and lightweight core; plotting requires the existing `research` extra.
+
 ## 2.0.0
 
 See [release notes](docs/releases/v2.0.0.md) for migration guidance and the complete changes.

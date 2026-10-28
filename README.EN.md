@@ -39,6 +39,28 @@ The service responds with `202 Accepted`:
 
 Poll `check_url`. The same `task_id` passes through `pending`, `running`, and `completed` or `failed`/`cancelled`. A completed response includes temperature, energy, temperature standard error, model version, seed, and artifact references. See the [API reference](docs/api_reference.md) for the complete contract and limits.
 
+## Analyze a saved simulation
+
+After `status="completed"`, analyze the saved velocities without running another simulation. JSON analysis works with the minimal installation:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/analyses \
+  -H 'Content-Type: application/json' \
+  -d '{"bins":32,"formats":[]}'
+```
+
+The request waits for generation in a bounded thread pool and returns **201 Created** with `analysis_id`, the committed `attempt_id`, and `artifacts.analysis` and `artifacts.manifest` URLs. For PNG and PDF, install `uv sync --frozen --extra research`, then request `{"bins":32,"formats":["png","pdf"]}`. The response adds `artifacts.png` and `artifacts.pdf`; open these URLs in a browser or download them:
+
+```bash
+curl -o analysis.json http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/analysis
+curl -o velocity_distribution.png http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/png
+curl -o report.pdf http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/pdf
+```
+
+In `/docs`, select **Scientific Analysis → POST /api/v1/simulations/{task_id}/analyses → Try it out**, enter a completed task ID and request body, then click **Execute**. The PNG has three panels for `v_x`, `v_y`, and speed against the 2D Gaussian/Rayleigh reference; the PDF adds context and limitations. Moment and visual agreement do not prove correctness or equilibration: the current model already starts in its equilibrium distribution.
+
+Two simultaneous analyses are allowed per API process by default; a busy service returns `429` with `Retry-After: 1`. This phase waits for completion over HTTP and has no persistent analysis queue. A disconnected request leaves its thread running and occupying capacity until completion; the client may lose its result URLs, and retrying POST creates a new analysis. See the [API reference](docs/api_reference.md) for source integrity checks, availability limits, and formats.
+
 ## Reproducibility
 
 - Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
@@ -57,7 +79,7 @@ The minimal installation runs the API and NumPy model. Install integrations expl
 | `dev` | pytest, Ruff, Pyright, package validation tools |
 | `redis` | Redis status storage and queue |
 | `tracking` | MLflow adapter |
-| `research` | research figures |
+| `research` | saved-velocity PNG/PDF reports and research figures |
 | `notebooks` | Jupyter and notebook tooling |
 | `observability` | OpenTelemetry and telemetry export |
 | `benchmark` | additional computational backends for comparisons |
