@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     max_particle_steps: int = Field(default=100_000_000, ge=1, le=100_000_000)
     max_queue_size: int = Field(default=100, ge=1, le=100_000)
     worker_count: int = Field(default=2, ge=1, le=32)
+    analysis_worker_count: int = Field(default=2, ge=1, le=8)
     task_ttl_seconds: int = Field(default=3600, ge=1)
     task_lease_seconds: int = Field(default=30, ge=3, le=3600)
     max_task_attempts: int = Field(default=3, ge=1, le=100)

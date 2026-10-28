@@ -34,7 +34,12 @@ tracker.start_run('test')
 tracker.log_params({'seed': 42})
 tracker.log_metrics({'temperature': 1.0})
 tracker.end_run()
-assert not any(name.split('.')[0] in {'opentelemetry', 'mlflow'} for name in sys.modules)
+assert not any(name.split('.')[0] in {'opentelemetry', 'mlflow', 'matplotlib'} for name in sys.modules)
+# FastAPI itself may import the OTel API when it is installed. The scientific
+# application still must not load experiment tracking or plotting libraries.
+from scientific_api.main import create_app
+assert create_app() is not None
+assert not any(name.split('.')[0] in {'mlflow', 'matplotlib'} for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", script], env=env, check=True)
 

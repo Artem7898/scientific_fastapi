@@ -39,6 +39,28 @@ curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
 
 Опросите `check_url`. Один и тот же `task_id` проходит состояния `pending`, `running` и `completed` либо `failed`/`cancelled`. Результат включает оценку температуры, энергию, стандартную ошибку температуры, версию модели, seed и ссылки на артефакты. Полный контракт и ограничения — в [справочнике API](docs/api_reference.md).
 
+## Анализ сохранённого расчёта
+
+После `status="completed"` можно исследовать сохранённые скорости без повторного запуска симуляции. JSON-анализ работает в минимальной установке:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/analyses \
+  -H 'Content-Type: application/json' \
+  -d '{"bins":32,"formats":[]}'
+```
+
+Запрос дожидается анализа в ограниченном пуле потоков и возвращает **201 Created** с `analysis_id`, подтверждённым `attempt_id` и URL `artifacts.analysis` и `artifacts.manifest`. Для PNG и PDF установите `uv sync --frozen --extra research`, затем запросите `{"bins":32,"formats":["png","pdf"]}`. В ответ добавятся URL `artifacts.png` и `artifacts.pdf`; откройте их в браузере или скачайте:
+
+```bash
+curl -o analysis.json http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/analysis
+curl -o velocity_distribution.png http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/png
+curl -o report.pdf http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/pdf
+```
+
+В `/docs` выберите **Scientific Analysis → POST /api/v1/simulations/{task_id}/analyses → Try it out**, укажите ID завершённого задания, тело запроса и нажмите **Execute**. PNG содержит три панели: распределения `v_x`, `v_y` и модуля скорости с двумерной теорией Гаусса/Рэлея; PDF добавляет описание и ограничения. Согласие моментов и графиков с теорией не является статистическим доказательством корректности или установления равновесия: текущая модель уже инициализируется в равновесном распределении.
+
+По умолчанию доступны два одновременных анализа на процесс API; при занятости ответ — `429` с `Retry-After: 1`. На этом этапе HTTP ожидает завершения, постоянной очереди анализов нет. При разрыве соединения поток продолжает работу и занимает слот до завершения; клиент может потерять URL результата, а повторный POST создаст новый анализ. Проверки исходных артефактов, сроки доступности и форматы описаны в [справочнике API](docs/api_reference.md).
+
 ## Что обеспечивает воспроизводимость
 
 - Каждый расчёт использует собственный `numpy.random.Generator` с явным seed и алгоритмом PCG64; число шагов входит в запрос.
@@ -57,7 +79,7 @@ curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
 | `dev` | pytest, Ruff, Pyright и инструменты проверки пакета |
 | `redis` | постоянное хранение статусов и очередь Redis |
 | `tracking` | адаптер MLflow |
-| `research` | построение исследовательских графиков |
+| `research` | PNG/PDF анализа сохранённых скоростей и исследовательские графики |
 | `notebooks` | Jupyter и инструменты notebook |
 | `observability` | OpenTelemetry и экспорт телеметрии |
 | `benchmark` | дополнительные вычислительные backend для сравнений |
