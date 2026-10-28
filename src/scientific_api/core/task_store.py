@@ -1,29 +1,30 @@
-"""Task state and leased, at-least-once delivery backends.
+"""Atomic leased queues, bounded replay and durable ensemble contributions.
 
-Only terminal records expire. A worker must renew its lease and stop computing
-before releasing a Redis job. Owner tokens prevent a worker whose lease was
-reclaimed from overwriting the current attempt's result. These guarantees do
-not make external side effects exactly-once; adapters must be idempotent.
-
-Methods are synchronous: asynchronous callers should use ``asyncio.to_thread``.
-Redis is imported only when its backend is selected.
+Only terminal state expires. Delivery is at least once; owner tokens fence
+results and progress, not external side effects. Redis supports a standalone
+instance, and is imported only when its backend is selected.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import json
+import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
 
+EVENT_LIMIT = 256
+TERMINAL = {"completed", "failed", "cancelled"}
+
 
 class QueueFull(Exception):
-    """The backend's pending and running capacity has been reached."""
+    """Pending and running capacity is exhausted."""
 
 
 @dataclass(frozen=True)
@@ -37,12 +38,29 @@ class Job:
 
 class TaskStore(Protocol):
     def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None: ...
-
     def get(self, task_id: str) -> dict[str, Any] | None: ...
     def claim(self) -> Job | None: ...
     def heartbeat(self, job: Job) -> bool: ...
     def finish(self, job: Job, result: dict[str, Any]) -> bool: ...
     def release(self, job: Job) -> bool: ...
+    def report_progress(
+        self, job: Job, completed_steps: int, total_steps: int, phase: str
+    ) -> bool: ...
+    def events(
+        self, task_id: str, after_id: str | None = None, limit: int = 100
+    ) -> dict | None: ...
+    def request_cancel(self, task_id: str) -> bool: ...
+    def is_cancel_requested(self, job: Job) -> bool: ...
+    def submit_ensemble(
+        self,
+        ensemble_id: str,
+        children: list[tuple[str, dict]],
+        carrier: dict,
+        metadata: dict,
+        idempotency_key: str | None = None,
+    ) -> str: ...
+    def get_ensemble(self, ensemble_id: str) -> dict | None: ...
+    def cancel_ensemble(self, ensemble_id: str) -> bool: ...
     def health(self) -> bool: ...
     def close(self) -> None: ...
 
@@ -56,19 +74,79 @@ def _validate_options(
 ) -> None:
     if max_queue_size < 1 or max_attempts < 1:
         raise ValueError("Queue capacity and maximum attempts must be positive")
-    if not (0 < ttl_seconds < float("inf")) or not (0 < lease_seconds < float("inf")):
+    if not 0 < ttl_seconds < float("inf") or not 0 < lease_seconds < float("inf"):
         raise ValueError("Record TTL and lease duration must be finite and positive")
 
 
 def _terminal_result(task_id: str, result: dict[str, Any]) -> dict[str, Any]:
-    if result.get("status") not in {"completed", "failed", "cancelled"}:
+    if result.get("status") not in TERMINAL:
         raise ValueError("A finished task must have a terminal status")
     record = copy.deepcopy(result)
     record["task_id"] = task_id
-    # Transport metadata is private even if an adapter accidentally includes it.
-    for field in ("payload", "carrier", "owner"):
-        record.pop(field, None)
+    for name in ("payload", "carrier", "owner"):
+        record.pop(name, None)
     return record
+
+
+def _cancelled(task_id: str) -> dict[str, str]:
+    return {"task_id": task_id, "status": "cancelled", "error": "Simulation cancelled by request"}
+
+
+def _total(payload: dict) -> int:
+    value = payload.get("num_steps", 0)
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _progress(completed_steps: int, total_steps: int, phase: str) -> None:
+    if (
+        type(completed_steps) is not int
+        or type(total_steps) is not int
+        or not 0 <= completed_steps <= total_steps
+        or total_steps <= 0
+        or not isinstance(phase, str)
+        or not 1 <= len(phase) <= 64
+    ):
+        raise ValueError("Progress requires integer 0 <= completed <= total and a bounded phase")
+
+
+def _cursor(after_id: str | None, limit: int) -> None:
+    if after_id is not None and (
+        not isinstance(after_id, str) or not re.fullmatch(r"\d+-\d+", after_id)
+    ):
+        raise ValueError("Event cursor must be a stream ID")
+    if type(limit) is not int or not 1 <= limit <= EVENT_LIMIT:
+        raise ValueError("Event limit must be in 1..256")
+
+
+def _ensemble_input(
+    ensemble_id: str, children: list[tuple[str, dict]], metadata: dict, idempotency_key: str | None
+) -> tuple[str, str | None]:
+    if not isinstance(ensemble_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", ensemble_id):
+        raise ValueError("Invalid ensemble identifier")
+    if not children or len({item[0] for item in children}) != len(children):
+        raise ValueError("An ensemble requires unique nonempty children")
+    for task_id, payload in children:
+        if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id):
+            raise ValueError("Invalid child identifier")
+        if not isinstance(payload, dict):
+            raise ValueError("Child payload must be an object")
+    canonical = json.dumps(
+        {"metadata": metadata, "payloads": [p for _, p in children]},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    fingerprint = metadata.get("request_fingerprint")
+    if fingerprint is None:
+        fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
+    elif not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", fingerprint):
+        raise ValueError("request_fingerprint must be a SHA256 digest")
+    token = None
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 256:
+            raise ValueError("Idempotency key must contain 1..256 characters")
+        token = hashlib.sha256(idempotency_key.encode()).hexdigest()
+    return fingerprint.lower(), token
 
 
 @dataclass
@@ -81,10 +159,27 @@ class _Entry:
     owner: str | None = None
     lease_until: float = 0.0
     expires_at: float | None = None
+    cancel_requested: bool = False
+    ensemble_id: str | None = None
+    completed_steps: int = 0
+    total_steps: int = 0
+    phase: str = "pending"
+    sequence: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=EVENT_LIMIT))
+
+
+@dataclass
+class _Ensemble:
+    metadata: dict
+    children: list[str]
+    results: dict[str, dict] = field(default_factory=dict)
+    expires_at: float | None = None
+    token: str | None = None
+    cancel_requested: bool = False
 
 
 class MemoryTaskStore:
-    """Per-application backend; restarting the process loses its task state."""
+    """One-process development queue; process restart loses all state."""
 
     def __init__(
         self,
@@ -94,11 +189,11 @@ class MemoryTaskStore:
         max_attempts: int = 3,
     ) -> None:
         _validate_options(max_queue_size, ttl_seconds, lease_seconds, max_attempts)
-        self._capacity = max_queue_size
-        self._ttl = ttl_seconds
-        self._lease = lease_seconds
-        self._max_attempts = max_attempts
+        self._capacity, self._ttl = max_queue_size, ttl_seconds
+        self._lease, self._max_attempts = lease_seconds, max_attempts
         self._entries: dict[str, _Entry] = {}
+        self._ensembles: dict[str, _Ensemble] = {}
+        self._idempotency: dict[str, tuple[str, str]] = {}
         self._pending: deque[str] = deque()
         self._active = 0
         self._lock = threading.Lock()
@@ -112,15 +207,65 @@ class MemoryTaskStore:
         for task_id, entry in list(self._entries.items()):
             if entry.expires_at is not None and entry.expires_at <= now:
                 del self._entries[task_id]
+        for ensemble_id, parent in list(self._ensembles.items()):
+            if parent.expires_at is not None and parent.expires_at <= now:
+                del self._ensembles[ensemble_id]
+                if parent.token and self._idempotency.get(parent.token, (None,))[0] == ensemble_id:
+                    self._idempotency.pop(parent.token, None)
 
-    def _complete(self, entry: _Entry, record: dict[str, Any], now: float) -> None:
+    @staticmethod
+    def _snapshot(task_id: str, entry: _Entry) -> dict:
+        return {
+            "task_id": task_id,
+            "status": entry.record["status"],
+            "phase": entry.phase,
+            "attempt": entry.attempts,
+            "completed_steps": entry.completed_steps,
+            "total_steps": entry.total_steps,
+        }
+
+    def _emit(self, task_id: str, entry: _Entry, phase: str) -> None:
+        entry.phase = phase
+        entry.sequence += 1
+        entry.history.append(
+            {"event_id": f"{entry.sequence}-0", "data": self._snapshot(task_id, entry)}
+        )
+
+    def _add(
+        self, task_id: str, payload: dict, carrier: dict, now: float, ensemble_id: str | None = None
+    ) -> None:
+        entry = _Entry(
+            copy.deepcopy(payload),
+            dict(carrier),
+            now,
+            {"task_id": task_id, "status": "pending"},
+            ensemble_id=ensemble_id,
+            total_steps=_total(payload),
+        )
+        self._entries[task_id] = entry
+        self._pending.append(task_id)
+        self._active += 1
+        self._emit(task_id, entry, "pending")
+
+    def _complete(self, task_id: str, entry: _Entry, record: dict, now: float) -> None:
         entry.record = record
-        entry.payload = {}
-        entry.carrier = {}
-        entry.owner = None
+        if record["status"] == "completed":
+            entry.completed_steps = entry.total_steps
+        self._emit(task_id, entry, record["status"])
+        entry.payload, entry.carrier, entry.owner = {}, {}, None
         entry.lease_until = 0
-        entry.expires_at = now + self._ttl
+        entry.cancel_requested = False
         self._active -= 1
+        parent = self._ensembles.get(entry.ensemble_id) if entry.ensemble_id else None
+        if parent is not None:
+            parent.results.setdefault(task_id, copy.deepcopy(record))
+            if len(parent.results) == len(parent.children):
+                parent.expires_at = now + self._ttl
+                for child in parent.children:
+                    if child in self._entries:
+                        self._entries[child].expires_at = now + self._ttl
+        else:
+            entry.expires_at = now + self._ttl
 
     def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None:
         with self._lock:
@@ -131,14 +276,7 @@ class MemoryTaskStore:
                 raise ValueError(f"Task already exists: {task_id}")
             if self._active >= self._capacity:
                 raise QueueFull("Pending and running task capacity has been reached")
-            self._entries[task_id] = _Entry(
-                copy.deepcopy(payload),
-                dict(carrier),
-                now,
-                {"task_id": task_id, "status": "pending"},
-            )
-            self._pending.append(task_id)
-            self._active += 1
+            self._add(task_id, payload, carrier, now)
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -155,8 +293,11 @@ class MemoryTaskStore:
             for task_id, entry in self._entries.items():
                 if entry.record["status"] != "running" or entry.lease_until > now:
                     continue
-                if entry.attempts >= self._max_attempts:
+                if entry.cancel_requested:
+                    self._complete(task_id, entry, _cancelled(task_id), now)
+                elif entry.attempts >= self._max_attempts:
                     self._complete(
+                        task_id,
                         entry,
                         {
                             "task_id": task_id,
@@ -168,22 +309,27 @@ class MemoryTaskStore:
                 else:
                     entry.record = {"task_id": task_id, "status": "pending"}
                     entry.owner = None
+                    entry.completed_steps = 0
+                    self._emit(task_id, entry, "retry")
                     self._pending.append(task_id)
-            if not self._pending:
-                return None
-            task_id = self._pending.popleft()
-            entry = self._entries[task_id]
-            entry.owner = str(uuid4())
-            entry.attempts += 1
-            entry.lease_until = now + self._lease
-            entry.record = {"task_id": task_id, "status": "running"}
-            return Job(
-                task_id,
-                copy.deepcopy(entry.payload),
-                dict(entry.carrier),
-                entry.submitted_at,
-                entry.owner,
-            )
+            while self._pending:
+                task_id = self._pending.popleft()
+                entry = self._entries.get(task_id)
+                if entry is None or entry.record["status"] != "pending":
+                    continue
+                entry.owner = str(uuid4())
+                entry.attempts += 1
+                entry.lease_until = now + self._lease
+                entry.record = {"task_id": task_id, "status": "running"}
+                self._emit(task_id, entry, "running")
+                return Job(
+                    task_id,
+                    copy.deepcopy(entry.payload),
+                    dict(entry.carrier),
+                    entry.submitted_at,
+                    entry.owner,
+                )
+            return None
 
     def _owned(self, job: Job, now: float) -> _Entry | None:
         entry = self._entries.get(job.task_id)
@@ -199,11 +345,10 @@ class MemoryTaskStore:
     def heartbeat(self, job: Job) -> bool:
         with self._lock:
             self._ensure_open()
-            now = _now()
-            entry = self._owned(job, now)
+            entry = self._owned(job, _now())
             if entry is None:
                 return False
-            entry.lease_until = now + self._lease
+            entry.lease_until = _now() + self._lease
             return True
 
     def finish(self, job: Job, result: dict[str, Any]) -> bool:
@@ -214,14 +359,149 @@ class MemoryTaskStore:
             entry = self._owned(job, now)
             if entry is None:
                 return False
-            self._complete(entry, record, now)
+            self._complete(
+                job.task_id,
+                entry,
+                _cancelled(job.task_id) if entry.cancel_requested else record,
+                now,
+            )
             return True
 
     def release(self, job: Job) -> bool:
-        # In-memory jobs cannot survive process shutdown, so make loss explicit.
         return self.finish(
             job, {"status": "cancelled", "error": "Simulation cancelled during shutdown"}
         )
+
+    def report_progress(self, job: Job, completed_steps: int, total_steps: int, phase: str) -> bool:
+        _progress(completed_steps, total_steps, phase)
+        with self._lock:
+            self._ensure_open()
+            entry = self._owned(job, _now())
+            if (
+                entry is None
+                or entry.cancel_requested
+                or completed_steps < entry.completed_steps
+                or entry.total_steps not in (0, total_steps)
+            ):
+                return False
+            entry.completed_steps, entry.total_steps = completed_steps, total_steps
+            self._emit(job.task_id, entry, phase)
+            return True
+
+    def events(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
+        _cursor(after_id, limit)
+        with self._lock:
+            self._ensure_open()
+            self._cleanup(_now())
+            entry = self._entries.get(task_id)
+            if entry is None:
+                return None
+            history = list(entry.history)
+            ids = [event["event_id"] for event in history]
+            reset = after_id not in (None, "0-0") and after_id not in ids
+            start = ids.index(after_id) + 1 if after_id in ids else 0
+            return {
+                "snapshot": self._snapshot(task_id, entry),
+                "events": [] if reset else copy.deepcopy(history[start : start + limit]),
+                "reset": reset,
+                "last_event_id": ids[-1],
+            }
+
+    def _cancel(self, task_id: str, now: float) -> bool:
+        entry = self._entries.get(task_id)
+        if entry is None or entry.record["status"] in {"completed", "failed"}:
+            return False
+        if entry.record["status"] == "cancelled" or entry.cancel_requested:
+            return True
+        if entry.record["status"] == "pending":
+            self._complete(task_id, entry, _cancelled(task_id), now)
+        else:
+            entry.cancel_requested = True
+            self._emit(task_id, entry, "cancel_requested")
+        return True
+
+    def request_cancel(self, task_id: str) -> bool:
+        with self._lock:
+            self._ensure_open()
+            self._cleanup(_now())
+            return self._cancel(task_id, _now())
+
+    def is_cancel_requested(self, job: Job) -> bool:
+        with self._lock:
+            self._ensure_open()
+            entry = self._owned(job, _now())
+            return entry is not None and entry.cancel_requested
+
+    def submit_ensemble(
+        self,
+        ensemble_id: str,
+        children: list[tuple[str, dict]],
+        carrier: dict,
+        metadata: dict,
+        idempotency_key: str | None = None,
+    ) -> str:
+        fingerprint, token = _ensemble_input(ensemble_id, children, metadata, idempotency_key)
+        with self._lock:
+            self._ensure_open()
+            now = _now()
+            self._cleanup(now)
+            if token in self._idempotency:
+                previous_id, previous_fingerprint = self._idempotency[token]
+                if previous_fingerprint != fingerprint:
+                    raise ValueError("Idempotency key conflicts with the original request")
+                return previous_id
+            if ensemble_id in self._ensembles or any(
+                child in self._entries for child, _ in children
+            ):
+                raise ValueError("An ensemble or child already exists")
+            if self._active + len(children) > self._capacity:
+                raise QueueFull("Insufficient capacity for the entire ensemble")
+            self._ensembles[ensemble_id] = _Ensemble(
+                copy.deepcopy(metadata), [child for child, _ in children], token=token
+            )
+            if token:
+                self._idempotency[token] = ensemble_id, fingerprint
+            for child, payload in children:
+                self._add(child, payload, carrier, now, ensemble_id)
+            return ensemble_id
+
+    def get_ensemble(self, ensemble_id: str) -> dict | None:
+        with self._lock:
+            self._ensure_open()
+            self._cleanup(_now())
+            parent = self._ensembles.get(ensemble_id)
+            if parent is None:
+                return None
+            return {
+                "ensemble_id": ensemble_id,
+                "metadata": copy.deepcopy(parent.metadata),
+                "children": list(parent.children),
+                "results": copy.deepcopy(parent.results),
+                "child_statuses": {
+                    child: (
+                        self._entries[child].record["status"]
+                        if child in self._entries
+                        else parent.results.get(child, {}).get("status", "")
+                    )
+                    for child in parent.children
+                },
+                "cancel_requested": parent.cancel_requested,
+            }
+
+    def cancel_ensemble(self, ensemble_id: str) -> bool:
+        with self._lock:
+            self._ensure_open()
+            now = _now()
+            self._cleanup(now)
+            parent = self._ensembles.get(ensemble_id)
+            if parent is None:
+                return False
+            if len(parent.results) == len(parent.children):
+                return parent.cancel_requested
+            parent.cancel_requested = True
+            for child in parent.children:
+                self._cancel(child, now)
+            return True
 
     def health(self) -> bool:
         with self._lock:
@@ -232,114 +512,299 @@ class MemoryTaskStore:
             self._closed = True
 
 
-# Lua keeps admission, lease reclamation and owner comparisons atomic across
-# processes. Redis TIME avoids differences between worker-machine clocks.
-_TIME = "local t=redis.call('TIME'); local now=tonumber(t[1])+tonumber(t[2])/1000000; "
+# All mutations execute atomically in standalone Redis, using server time.
+# Raw payload/result JSON is never decoded and re-encoded by Lua: this preserves
+# uint64 seeds that cannot be represented exactly by Lua's floating-point numbers.
+_LUA = r"""
+local prefix=ARGV[1]
+local ttl=tonumber(ARGV[2])
+local clock=redis.call('TIME')
+local now=tonumber(clock[1])+tonumber(clock[2])/1000000
+local pending=prefix..'pending'
+local running=prefix..'running'
+local active=prefix..'active'
+local function taskkey(id) return prefix..'task:'..id end
+local function streamkey(id) return prefix..'events:'..id end
+local function parentkey(id) return prefix..'ensemble:'..id end
+local function emit(id,phase,completed,total)
+    local key=taskkey(id)
+    if completed then redis.call('HSET',key,'completed_steps',completed) end
+    if total then redis.call('HSET',key,'total_steps',total) end
+    local data=cjson.encode({task_id=id,status=redis.call('HGET',key,'state'),phase=phase,
+        attempt=tonumber(redis.call('HGET',key,'attempts') or '0'),
+        completed_steps=tonumber(redis.call('HGET',key,'completed_steps') or '0'),
+        total_steps=tonumber(redis.call('HGET',key,'total_steps') or '0')})
+    local event=redis.call('XADD',streamkey(id),'MAXLEN',256,'*','data',data)
+    redis.call('HSET',key,'progress',data,'last_event_id',event)
+end
+local function cancelled(id)
+    return cjson.encode({task_id=id,status='cancelled',error='Simulation cancelled by request'})
+end
+local function complete(id,state,record)
+    local key=taskkey(id)
+    redis.call('HSET',key,'state',state,'record',record)
+    if state=='completed' then
+        redis.call('HSET',key,'completed_steps',redis.call('HGET',key,'total_steps') or '0')
+    end
+    emit(id,state)
+    redis.call('HDEL',key,'payload','carrier','owner','lease_until','cancel_requested')
+    redis.call('SREM',active,id)
+    redis.call('ZREM',running,id)
+    redis.call('LREM',pending,0,id)
+    local parent=redis.call('HGET',key,'ensemble_id')
+    if parent and redis.call('EXISTS',parentkey(parent))==1 then
+        local pk=parentkey(parent)
+        if redis.call('HSETNX',pk,'result:'..id,record)==1 then
+            redis.call('HINCRBY',pk,'finished',1)
+        end
+        if tonumber(redis.call('HGET',pk,'finished'))==tonumber(redis.call('HGET',pk,'count')) then
+            redis.call('PEXPIRE',pk,ttl)
+            local token=redis.call('HGET',pk,'idempotency')
+            if token then redis.call('PEXPIRE',prefix..'idempotency:'..token,ttl) end
+            local children=cjson.decode(redis.call('HGET',pk,'children'))
+            for _,child in ipairs(children) do
+                redis.call('PEXPIRE',taskkey(child),ttl)
+                redis.call('PEXPIRE',streamkey(child),ttl)
+            end
+        end
+    else
+        redis.call('PEXPIRE',key,ttl)
+        redis.call('PEXPIRE',streamkey(id),ttl)
+    end
+end
+local function owned(id,owner)
+    local key=taskkey(id)
+    return redis.call('HGET',key,'state')=='running'
+        and redis.call('HGET',key,'owner')==owner
+        and tonumber(redis.call('HGET',key,'lease_until') or '0')>now
+end
+local function add(id,payload,carrier,total,parent)
+    redis.call('HSET',taskkey(id),'payload',payload,'carrier',carrier,
+        'submitted_at',tostring(now),'attempts',0,'state','pending','completed_steps',0,
+        'total_steps',total,'record',cjson.encode({task_id=id,status='pending'}))
+    if parent then redis.call('HSET',taskkey(id),'ensemble_id',parent) end
+    redis.call('RPUSH',pending,id)
+    redis.call('SADD',active,id)
+    emit(id,'pending')
+end
+local function cancel(id)
+    local key=taskkey(id)
+    local state=redis.call('HGET',key,'state')
+    if not state or state=='completed' or state=='failed' then return false end
+    if state=='cancelled' or redis.call('HGET',key,'cancel_requested')=='1' then return true end
+    if state=='pending' then complete(id,'cancelled',cancelled(id))
+    else redis.call('HSET',key,'cancel_requested',1); emit(id,'cancel_requested') end
+    return true
+end
+"""
 
 _SUBMIT = (
-    _TIME
-    + """
-if redis.call('EXISTS',KEYS[1]) == 1 then return -2 end
-if redis.call('SCARD',KEYS[3]) >= tonumber(ARGV[4]) then return -1 end
-redis.call('HSET',KEYS[1], 'payload',ARGV[2], 'carrier',ARGV[3],
-    'submitted_at',tostring(now), 'attempts',0, 'state','pending',
-    'record',cjson.encode({task_id=ARGV[1],status='pending'}))
-redis.call('RPUSH',KEYS[2],ARGV[1]); redis.call('SADD',KEYS[3],ARGV[1])
+    _LUA
+    + r"""
+local id=ARGV[3]
+if redis.call('EXISTS',taskkey(id))==1 then return -2 end
+if redis.call('SCARD',active)>=tonumber(ARGV[6]) then return -1 end
+add(id,ARGV[4],ARGV[5],ARGV[7]); return 1
+"""
+)
+_CLAIM = (
+    _LUA
+    + r"""
+local expired=redis.call('ZRANGEBYSCORE',running,'-inf',now)
+for _,id in ipairs(expired) do
+    local key=taskkey(id)
+    if redis.call('HGET',key,'state')=='running' then
+        if redis.call('HGET',key,'cancel_requested')=='1' then
+            complete(id,'cancelled',cancelled(id))
+        elseif tonumber(redis.call('HGET',key,'attempts') or '0')>=tonumber(ARGV[5]) then
+            complete(id,'failed',cjson.encode({task_id=id,status='failed',
+                error='Worker lease expired; maximum attempts exhausted'}))
+        else
+            redis.call('HSET',key,'state','pending','record',cjson.encode({task_id=id,status='pending'}))
+            redis.call('HDEL',key,'owner','lease_until')
+            emit(id,'retry',0)
+            redis.call('RPUSH',pending,id)
+        end
+    elseif redis.call('EXISTS',key)==0 then redis.call('SREM',active,id) end
+    redis.call('ZREM',running,id)
+end
+while true do
+    local id=redis.call('LPOP',pending)
+    if not id then return nil end
+    local key=taskkey(id)
+    if redis.call('HGET',key,'state')=='pending' then
+        redis.call('HINCRBY',key,'attempts',1)
+        redis.call('HSET',key,'state','running','owner',ARGV[3],
+            'lease_until',tostring(now+tonumber(ARGV[4])),
+            'record',cjson.encode({task_id=id,status='running'}))
+        redis.call('ZADD',running,now+tonumber(ARGV[4]),id)
+        emit(id,'running')
+        return {id,redis.call('HGET',key,'payload'),redis.call('HGET',key,'carrier'),
+            redis.call('HGET',key,'submitted_at'),ARGV[3]}
+    elseif redis.call('EXISTS',key)==0 then redis.call('SREM',active,id) end
+end
+"""
+)
+_HEARTBEAT = (
+    _LUA
+    + r"""
+if not owned(ARGV[3],ARGV[4]) then return 0 end
+redis.call('HSET',taskkey(ARGV[3]),'lease_until',tostring(now+tonumber(ARGV[5])))
+redis.call('ZADD',running,now+tonumber(ARGV[5]),ARGV[3]); return 1
+"""
+)
+_FINISH = (
+    _LUA
+    + r"""
+local id=ARGV[3]
+if not owned(id,ARGV[4]) then return 0 end
+if redis.call('HGET',taskkey(id),'cancel_requested')=='1' then
+    complete(id,'cancelled',cancelled(id))
+else complete(id,ARGV[5],ARGV[6]) end
 return 1
 """
 )
-
-_CLAIM = (
-    _TIME
-    + """
-local expired=redis.call('ZRANGEBYSCORE',KEYS[2],'-inf',now)
-for _,id in ipairs(expired) do
-    local key=ARGV[1]..id
-    if redis.call('HGET',key,'state') == 'running' then
-        if tonumber(redis.call('HGET',key,'attempts') or '0') >= tonumber(ARGV[4]) then
-            redis.call('HSET',key,'state','failed','record',cjson.encode({
-                task_id=id,status='failed',
-                error='Worker lease expired; maximum attempts exhausted'}))
-            redis.call('HDEL',key,'owner','lease_until','payload','carrier')
-            redis.call('PEXPIRE',key,ARGV[5]); redis.call('SREM',KEYS[3],id)
-        else
-            redis.call('HSET',key,'state','pending','record',
-                cjson.encode({task_id=id,status='pending'}))
-            redis.call('HDEL',key,'owner','lease_until')
-            redis.call('RPUSH',KEYS[1],id)
-        end
-    elseif redis.call('EXISTS',key) == 0 then
-        redis.call('SREM',KEYS[3],id)
-    end
-    redis.call('ZREM',KEYS[2],id)
-end
-while true do
-    local id=redis.call('LPOP',KEYS[1])
-    if not id then return nil end
-    local key=ARGV[1]..id
-    if redis.call('HGET',key,'state') == 'pending' then
-        redis.call('HINCRBY',key,'attempts',1)
-        redis.call('HSET',key,'state','running','owner',ARGV[2],
-            'lease_until',tostring(now+tonumber(ARGV[3])),
-            'record',cjson.encode({task_id=id,status='running'}))
-        redis.call('ZADD',KEYS[2],now+tonumber(ARGV[3]),id)
-        return {id,redis.call('HGET',key,'payload'),
-            redis.call('HGET',key,'carrier'),
-            redis.call('HGET',key,'submitted_at'),ARGV[2]}
-    elseif redis.call('EXISTS',key) == 0 then
-        redis.call('SREM',KEYS[3],id)
-    end
-end
-"""
-)
-
-_OWNED = (
-    _TIME
-    + """
-if redis.call('HGET',KEYS[1],'state') ~= 'running'
-    or redis.call('HGET',KEYS[1],'owner') ~= ARGV[2]
-    or tonumber(redis.call('HGET',KEYS[1],'lease_until') or '0') <= now
-then return 0 end
-"""
-)
-
-_HEARTBEAT = (
-    _OWNED
-    + """
-redis.call('HSET',KEYS[1],'lease_until',tostring(now+tonumber(ARGV[3])))
-redis.call('ZADD',KEYS[2],now+tonumber(ARGV[3]),ARGV[1]); return 1
-"""
-)
-
-_FINISH = (
-    _OWNED
-    + """
-redis.call('HSET',KEYS[1],'state',ARGV[3],'record',ARGV[4])
-redis.call('HDEL',KEYS[1],'owner','lease_until','payload','carrier')
-redis.call('PEXPIRE',KEYS[1],ARGV[5])
-redis.call('ZREM',KEYS[2],ARGV[1]); redis.call('SREM',KEYS[3],ARGV[1]); return 1
-"""
-)
-
 _RELEASE = (
-    _OWNED
-    + """
-redis.call('HSET',KEYS[1],'state','pending','record',
-    cjson.encode({task_id=ARGV[1],status='pending'}))
-redis.call('HDEL',KEYS[1],'owner','lease_until')
--- Cooperative shutdown does not consume a failed delivery attempt.
-redis.call('HINCRBY',KEYS[1],'attempts',-1)
-redis.call('ZREM',KEYS[2],ARGV[1]); redis.call('RPUSH',KEYS[3],ARGV[1]); return 1
+    _LUA
+    + r"""
+local id=ARGV[3]
+if not owned(id,ARGV[4]) then return 0 end
+local key=taskkey(id)
+if redis.call('HGET',key,'cancel_requested')=='1' then
+    complete(id,'cancelled',cancelled(id)); return 1
+end
+redis.call('HSET',key,'state','pending','record',cjson.encode({task_id=id,status='pending'}))
+redis.call('HDEL',key,'owner','lease_until')
+redis.call('HINCRBY',key,'attempts',-1)
+redis.call('ZREM',running,id); redis.call('RPUSH',pending,id)
+emit(id,'retry',0); return 1
+"""
+)
+_PROGRESS = (
+    _LUA
+    + r"""
+local id=ARGV[3]
+local key=taskkey(id)
+if not owned(id,ARGV[4]) or redis.call('HGET',key,'cancel_requested')=='1' then return 0 end
+local completed=tonumber(ARGV[5]); local total=tonumber(ARGV[6])
+local previous=tonumber(redis.call('HGET',key,'completed_steps') or '0')
+local expected=tonumber(redis.call('HGET',key,'total_steps') or '0')
+if completed<previous or (expected~=0 and expected~=total) then return 0 end
+emit(id,ARGV[7],completed,total); return 1
+"""
+)
+_EVENTS = (
+    _LUA
+    + r"""
+local key=taskkey(ARGV[3])
+if redis.call('EXISTS',key)==0 then return nil end
+-- Existing pre-progress records remain readable without rewriting their JSON.
+if not redis.call('HGET',key,'progress') then
+    local total=tonumber(redis.call('HGET',key,'total_steps') or '0')
+    local raw=redis.call('HGET',key,'payload') or redis.call('HGET',key,'record')
+    if total==0 and raw and #raw<=2097152 then
+        local ok,decoded=pcall(cjson.decode,raw)
+        if ok and type(decoded)=='table' and type(decoded.num_steps)=='number'
+            and decoded.num_steps>=0 and decoded.num_steps<=10000 then
+            total=math.floor(decoded.num_steps)
+        end
+    end
+    local state=redis.call('HGET',key,'state') or 'pending'
+    emit(ARGV[3],state,state=='completed' and total or 0,total)
+    local remaining=redis.call('PTTL',key)
+    if remaining>0 then redis.call('PEXPIRE',streamkey(ARGV[3]),remaining) end
+end
+local rows=redis.call('XRANGE',streamkey(ARGV[3]),'-','+')
+local found=(ARGV[4]=='' or ARGV[4]=='0-0')
+local start=1
+if not found then
+    for i,row in ipairs(rows) do
+        if row[1]==ARGV[4] then found=true; start=i+1; break end
+    end
+end
+local selected={}
+if found then
+    for i=start,math.min(#rows,start+tonumber(ARGV[5])-1) do
+        selected[#selected+1]=rows[i]
+    end
+end
+return {redis.call('HGET',key,'progress'),selected,found and 0 or 1,
+        redis.call('HGET',key,'last_event_id')}
+"""
+)
+_CANCEL = _LUA + "return cancel(ARGV[3]) and 1 or 0"
+_IS_CANCEL = (
+    _LUA
+    + r"""
+return (owned(ARGV[3],ARGV[4]) and redis.call('HGET',taskkey(ARGV[3]),'cancel_requested')=='1') and 1 or 0
+"""
+)
+_SUBMIT_ENSEMBLE = (
+    _LUA
+    + r"""
+local id=ARGV[3]; local token=ARGV[8]; local fingerprint=ARGV[9]
+if token~='' then
+    local idem=prefix..'idempotency:'..token
+    local previous=redis.call('HGET',idem,'ensemble_id')
+    if previous and redis.call('EXISTS',parentkey(previous))==1 then
+        if redis.call('HGET',idem,'fingerprint')~=fingerprint then return {-3} end
+        return {1,previous}
+    end
+end
+local children=cjson.decode(ARGV[4])
+if redis.call('EXISTS',parentkey(id))==1 then return {-2} end
+for _,child in ipairs(children) do
+    if redis.call('EXISTS',taskkey(child.id))==1 then return {-2} end
+end
+if redis.call('SCARD',active)+#children>tonumber(ARGV[7]) then return {-1} end
+local ids={}
+for _,child in ipairs(children) do ids[#ids+1]=child.id end
+redis.call('HSET',parentkey(id),'metadata',ARGV[6],'children',cjson.encode(ids),
+    'count',#ids,'finished',0,'cancel_requested',0)
+if token~='' then
+    redis.call('HSET',parentkey(id),'idempotency',token)
+    redis.call('HSET',prefix..'idempotency:'..token,'ensemble_id',id,'fingerprint',fingerprint)
+    redis.call('PERSIST',prefix..'idempotency:'..token)
+end
+for _,child in ipairs(children) do add(child.id,child.payload,ARGV[5],child.total,id) end
+return {1,id}
+"""
+)
+_GET_ENSEMBLE = (
+    _LUA
+    + r"""
+local pk=parentkey(ARGV[3])
+if redis.call('EXISTS',pk)==0 then return nil end
+local children=cjson.decode(redis.call('HGET',pk,'children'))
+local results={}; local statuses={}
+for _,id in ipairs(children) do
+    local result=redis.call('HGET',pk,'result:'..id)
+    if result then results[#results+1]=id; results[#results+1]=result end
+    local state=redis.call('HGET',taskkey(id),'state')
+    if not state and result then state=cjson.decode(result).status end
+    statuses[#statuses+1]=id; statuses[#statuses+1]=state or ''
+end
+return {redis.call('HGET',pk,'metadata'),redis.call('HGET',pk,'children'),results,statuses,
+        redis.call('HGET',pk,'cancel_requested') or '0'}
+"""
+)
+_CANCEL_ENSEMBLE = (
+    _LUA
+    + r"""
+local pk=parentkey(ARGV[3])
+if redis.call('EXISTS',pk)==0 then return 0 end
+if redis.call('HGET',pk,'finished')==redis.call('HGET',pk,'count') then
+    return tonumber(redis.call('HGET',pk,'cancel_requested') or '0')
+end
+redis.call('HSET',pk,'cancel_requested',1)
+for _,id in ipairs(cjson.decode(redis.call('HGET',pk,'children'))) do cancel(id) end
+return 1
 """
 )
 
 
 class RedisTaskStore:
-    """Shared reliable queue for a standalone Redis instance.
-
-    Creating or closing a client never resets another worker's jobs. Use the
-    same namespace to share a queue; choose different namespaces for isolation.
-    """
+    """Shared standalone Redis queue; namespaces isolate all state and replay."""
 
     def __init__(
         self,
@@ -369,39 +834,49 @@ class RedisTaskStore:
             retry=retry.Retry(backoff.NoBackoff(), 0),
             health_check_interval=30,
         )
-        self._capacity = max_queue_size
-        self._ttl_ms = max(1, int(ttl_seconds * 1000))
-        self._lease = lease_seconds
-        self._max_attempts = max_attempts
+        self._capacity, self._ttl_ms = max_queue_size, max(1, int(ttl_seconds * 1000))
+        self._lease, self._max_attempts = lease_seconds, max_attempts
+        self._prefix = f"{namespace}:"
         self._task_prefix = f"{namespace}:task:"
-        self._pending = f"{namespace}:pending"
-        self._running = f"{namespace}:running"
-        self._active = f"{namespace}:active"
         self._closed = False
-        self._submit = self._redis.register_script(_SUBMIT)
-        self._claim = self._redis.register_script(_CLAIM)
-        self._heartbeat = self._redis.register_script(_HEARTBEAT)
-        self._finish = self._redis.register_script(_FINISH)
-        self._release = self._redis.register_script(_RELEASE)
+        self._scripts = {
+            name: self._redis.register_script(script)
+            for name, script in {
+                "submit": _SUBMIT,
+                "claim": _CLAIM,
+                "heartbeat": _HEARTBEAT,
+                "finish": _FINISH,
+                "release": _RELEASE,
+                "progress": _PROGRESS,
+                "events": _EVENTS,
+                "cancel": _CANCEL,
+                "is_cancel": _IS_CANCEL,
+                "ensemble": _SUBMIT_ENSEMBLE,
+                "get_ensemble": _GET_ENSEMBLE,
+                "cancel_ensemble": _CANCEL_ENSEMBLE,
+            }.items()
+        }
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("Task backend is closed")
 
-    def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None:
+    def _call(self, name: str, *args: Any) -> Any:
         self._ensure_open()
-        result = self._submit(
-            keys=[self._task_prefix + task_id, self._pending, self._active],
-            args=[
-                task_id,
-                json.dumps(payload, allow_nan=False),
-                json.dumps(carrier),
-                self._capacity,
-            ],
+        return self._scripts[name](args=[self._prefix, self._ttl_ms, *args])
+
+    def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None:
+        code = self._call(
+            "submit",
+            task_id,
+            json.dumps(payload, allow_nan=False),
+            json.dumps(carrier),
+            self._capacity,
+            _total(payload),
         )
-        if result == -1:
+        if code == -1:
             raise QueueFull("Pending and running task capacity has been reached")
-        if result == -2:
+        if code == -2:
             raise ValueError(f"Task already exists: {task_id}")
 
     def get(self, task_id: str) -> dict[str, Any] | None:
@@ -410,59 +885,104 @@ class RedisTaskStore:
         return json.loads(raw) if raw is not None else None
 
     def claim(self) -> Job | None:
-        self._ensure_open()
-        result = self._claim(
-            keys=[self._pending, self._running, self._active],
-            args=[self._task_prefix, str(uuid4()), self._lease, self._max_attempts, self._ttl_ms],
-        )
-        if not result:
-            return None
-        return Job(
-            task_id=result[0],
-            payload=json.loads(result[1]),
-            carrier=json.loads(result[2]),
-            submitted_at=float(result[3]),
-            owner=result[4],
+        row = self._call("claim", str(uuid4()), self._lease, self._max_attempts)
+        return (
+            Job(row[0], json.loads(row[1]), json.loads(row[2]), float(row[3]), row[4])
+            if row
+            else None
         )
 
     def heartbeat(self, job: Job) -> bool:
-        self._ensure_open()
-        return bool(
-            self._heartbeat(
-                keys=[self._task_prefix + job.task_id, self._running],
-                args=[job.task_id, job.owner, self._lease],
-            )
-        )
+        return bool(self._call("heartbeat", job.task_id, job.owner, self._lease))
 
     def finish(self, job: Job, result: dict[str, Any]) -> bool:
-        self._ensure_open()
         record = _terminal_result(job.task_id, result)
         return bool(
-            self._finish(
-                keys=[self._task_prefix + job.task_id, self._running, self._active],
-                args=[
-                    job.task_id,
-                    job.owner,
-                    record["status"],
-                    json.dumps(record, allow_nan=False),
-                    self._ttl_ms,
-                ],
+            self._call(
+                "finish",
+                job.task_id,
+                job.owner,
+                record["status"],
+                json.dumps(record, allow_nan=False),
             )
         )
 
     def release(self, job: Job) -> bool:
-        self._ensure_open()
+        return bool(self._call("release", job.task_id, job.owner))
+
+    def report_progress(self, job: Job, completed_steps: int, total_steps: int, phase: str) -> bool:
+        _progress(completed_steps, total_steps, phase)
         return bool(
-            self._release(
-                keys=[self._task_prefix + job.task_id, self._running, self._pending],
-                args=[job.task_id, job.owner],
-            )
+            self._call("progress", job.task_id, job.owner, completed_steps, total_steps, phase)
         )
 
+    def events(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
+        _cursor(after_id, limit)
+        row = self._call("events", task_id, after_id or "", limit)
+        if not row:
+            return None
+        return {
+            "snapshot": json.loads(row[0]),
+            "events": [{"event_id": event[0], "data": json.loads(event[1][1])} for event in row[1]],
+            "reset": bool(row[2]),
+            "last_event_id": row[3],
+        }
+
+    def request_cancel(self, task_id: str) -> bool:
+        return bool(self._call("cancel", task_id))
+
+    def is_cancel_requested(self, job: Job) -> bool:
+        return bool(self._call("is_cancel", job.task_id, job.owner))
+
+    def submit_ensemble(
+        self,
+        ensemble_id: str,
+        children: list[tuple[str, dict]],
+        carrier: dict,
+        metadata: dict,
+        idempotency_key: str | None = None,
+    ) -> str:
+        fingerprint, token = _ensemble_input(ensemble_id, children, metadata, idempotency_key)
+        packed = [
+            {"id": child, "payload": json.dumps(payload, allow_nan=False), "total": _total(payload)}
+            for child, payload in children
+        ]
+        row = self._call(
+            "ensemble",
+            ensemble_id,
+            json.dumps(packed),
+            json.dumps(carrier),
+            json.dumps(metadata, allow_nan=False),
+            self._capacity,
+            token or "",
+            fingerprint,
+        )
+        if row[0] == -1:
+            raise QueueFull("Insufficient capacity for the entire ensemble")
+        if row[0] == -2:
+            raise ValueError("An ensemble or child already exists")
+        if row[0] == -3:
+            raise ValueError("Idempotency key conflicts with the original request")
+        return row[1]
+
+    def get_ensemble(self, ensemble_id: str) -> dict | None:
+        row = self._call("get_ensemble", ensemble_id)
+        if not row:
+            return None
+        return {
+            "ensemble_id": ensemble_id,
+            "metadata": json.loads(row[0]),
+            "children": json.loads(row[1]),
+            "results": {row[2][i]: json.loads(row[2][i + 1]) for i in range(0, len(row[2]), 2)},
+            "child_statuses": dict(zip(row[3][::2], row[3][1::2], strict=True)),
+            "cancel_requested": row[4] == "1",
+        }
+
+    def cancel_ensemble(self, ensemble_id: str) -> bool:
+        return bool(self._call("cancel_ensemble", ensemble_id))
+
     def health(self) -> bool:
-        if self._closed:
-            return False
-        return bool(self._redis.ping())
+        return not self._closed and bool(self._redis.ping())
 
     def close(self) -> None:
         if not self._closed:

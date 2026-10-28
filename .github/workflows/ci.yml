@@ -150,12 +150,76 @@ jobs:
               assert hashlib.sha256(response.read()).hexdigest() == expected["sha256"]
           print("Persisted Redis state and artifact volume survived restart")
           PYTHON
+      - name: Verify separate worker, ensembles and SSE in the container stack
+        run: |
+          docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach --wait --wait-timeout 180 api redis
+          python - <<'PYTHON'
+          import json
+          import subprocess
+          import time
+          import urllib.request
+
+          compose = ["docker", "compose", "-f", "docker-compose.yml", "-f", "compose.worker.yml"]
+          subprocess.run([*compose, "stop", "worker"], check=True)
+          base = "http://127.0.0.1:8000"
+
+          def read(path):
+              with urllib.request.urlopen(base + path, timeout=5) as response:
+                  return json.load(response)
+
+          payload = {
+              "model": "ideal-gas-ou-v1",
+              "parameters": {"initial_temperature": 1.0, "num_particles": 32, "num_steps": 3},
+              "replicas": 3, "base_seed": 2**64 - 1,
+          }
+          request = urllib.request.Request(
+              base + "/api/v1/ensembles", data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json", "Idempotency-Key": "container-ensemble"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              accepted = json.load(response)
+          time.sleep(0.2)
+          assert read(accepted["check_url"])["counts"]["pending"] == 3
+          subprocess.run([*compose, "up", "--build", "--detach", "worker"], check=True)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              result = read(accepted["check_url"])
+              if result["status"] == "completed":
+                  break
+              assert result["status"] in {"pending", "running"}, result
+              time.sleep(0.1)
+          else:
+              raise AssertionError("Separate worker did not finish the ensemble")
+          assert result["counts"]["completed"] == 3
+          manifest = read(accepted["check_url"] + "/manifest")
+          assert manifest["outputs"] == result
+          assert manifest["seeds"] == [child["seed"] for child in result["children"]]
+          for child in result["children"]:
+              task_id = child["task_id"]
+              source = read(f"/api/v1/simulations/{task_id}/artifacts/manifest")
+              assert source["parameters"]["seed"] == child["seed"]
+              assert source["outputs"]["attempt_id"] == child["result"]["attempt_id"]
+          path = "/api/v1/simulations/" + result["children"][0]["task_id"] + "/events"
+          with urllib.request.urlopen(base + path, timeout=5) as response:
+              assert response.headers["Content-Type"].startswith("text/event-stream")
+              stream = response.read().decode()
+          assert '"phase":"saving_artifacts"' in stream
+          assert '"status":"completed"' in stream
+          first_id = next(line[4:] for line in stream.splitlines() if line.startswith("id: "))
+          reconnect = urllib.request.Request(base + path, headers={"Last-Event-ID": first_id})
+          with urllib.request.urlopen(reconnect, timeout=5) as response:
+              replay = response.read().decode()
+          assert '"status":"completed"' in replay
+          assert not any(line == "id: " + first_id for line in replay.splitlines())
+          print("Separate worker, ensemble provenance, uint64 seeds and SSE replay passed")
+          PYTHON
       - name: Show container logs after failure
         if: failure()
-        run: docker compose logs --no-color
+        run: docker compose -f docker-compose.yml -f compose.worker.yml logs --no-color
       - name: Remove CI containers and generated volumes
         if: always()
-        run: docker compose down --volumes
+        run: docker compose -f docker-compose.yml -f compose.worker.yml down --volumes
 
   optional-benchmarks:
     if: github.event_name == 'workflow_dispatch' && inputs.optional_benchmarks

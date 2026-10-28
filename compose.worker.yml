@@ -1,0 +1,37 @@
+# Split API and consumers while preserving the default embedded Compose stack.
+# docker compose -f docker-compose.yml -f compose.worker.yml up --build
+services:
+  api:
+    environment:
+      EXECUTION_MODE: api
+
+  worker:
+    build: .
+    command: ["python", "-m", "scientific_api.worker"]
+    restart: unless-stopped
+    stop_grace_period: 15s
+    depends_on:
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+        required: false
+    environment:
+      EXECUTION_MODE: worker
+      REDIS_URI: redis://redis:6379/0
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
+      MLFLOW_EXPERIMENT_NAME: computational_physics
+      ARTIFACTS_DIR: /data/runs
+      MAX_QUEUE_SIZE: "100"
+      WORKER_COUNT: "2"
+      TASK_TTL_SECONDS: "3600"
+      MAX_SIMULATION_ITERATIONS: "10000"
+      MAX_PARTICLE_STEPS: "100000000"
+    # The image's HTTP health check belongs to the API role. The worker process
+    # exits on an unexpected consumer-loop failure and exposes no HTTP port.
+    healthcheck:
+      disable: true
+    volumes:
+      - run_artifacts:/data/runs
+    networks:
+      - backend

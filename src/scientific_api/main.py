@@ -16,6 +16,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import __version__
 from .adapters.mlflow_adapter import build_tracker
 from .api.v1.endpoints.analyses import router as analysis_router
+from .api.v1.endpoints.ensembles import router as ensemble_router
+from .api.v1.endpoints.events import router as event_router
 from .api.v1.endpoints.simulations import router as sim_router
 from .core.analysis_manager import AnalysisManager
 from .core.config import Settings
@@ -116,7 +118,7 @@ def create_app(
             configuration.artifacts_dir.mkdir(parents=True, exist_ok=True)
             tracker = await asyncio.to_thread(
                 build_tracker,
-                configuration.mlflow_tracking_uri,
+                configuration.mlflow_tracking_uri if configuration.execution_mode != "api" else "",
                 configuration.mlflow_experiment_name,
             )
             monitoring = (
@@ -138,7 +140,8 @@ def create_app(
                 configuration.artifacts_dir, configuration.analysis_worker_count
             )
             application.state.analysis_manager = analyses
-            await manager.start()
+            if configuration.execution_mode in {"embedded", "worker"}:
+                await manager.start()
             yield
         finally:
             try:
@@ -167,6 +170,8 @@ def create_app(
     application.add_middleware(RequestTelemetryMiddleware)
     application.include_router(sim_router, prefix="/api/v1")
     application.include_router(analysis_router, prefix="/api/v1")
+    application.include_router(ensemble_router, prefix="/api/v1")
+    application.include_router(event_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -186,7 +191,9 @@ def create_app(
     @application.get("/health/ready", tags=["Health"])
     async def ready(request: Request) -> dict[str, str]:
         manager = getattr(request.app.state, "queue_manager", None)
-        if manager is None or not manager.ready:
+        if manager is None:
+            raise HTTPException(503, "Task resources are unavailable")
+        if configuration.execution_mode != "api" and not manager.ready:
             raise HTTPException(503, "Simulation workers are unavailable")
         try:
             healthy = await asyncio.to_thread(manager.backend.health)

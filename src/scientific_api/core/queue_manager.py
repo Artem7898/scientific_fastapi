@@ -90,6 +90,14 @@ class QueueManager:
                 logger.warning("Worker lost its task lease for %s", job.task_id)
                 cancelled.set()
                 return
+            try:
+                if await asyncio.to_thread(self.backend.is_cancel_requested, job):
+                    cancelled.set()
+                    return
+            except Exception:
+                logger.exception("Could not check task cancellation")
+                cancelled.set()
+                return
 
     async def _release(self, job: Job) -> None:
         try:
@@ -97,6 +105,38 @@ class QueueManager:
         except Exception:
             # Redis will recover the expired lease after reconnecting.
             logger.exception("Could not release interrupted task %s", job.task_id)
+
+    async def _finish(self, job: Job, result: dict[str, Any]) -> bool:
+        committed = await asyncio.to_thread(self.backend.finish, job, result)
+        if committed:
+            # A concurrent persisted cancellation can atomically replace the
+            # requested outcome. Count the actual terminal state.
+            record = await asyncio.to_thread(self.backend.get, job.task_id)
+            if record is not None:
+                self.telemetry.record_task(record["status"])
+        return committed
+
+    async def _cancel_or_release(self, job: Job) -> None:
+        try:
+            if await asyncio.to_thread(self.backend.is_cancel_requested, job):
+                await self._finish(
+                    job, {"status": "cancelled", "error": "Cancellation requested by client"}
+                )
+            else:
+                await self._release(job)
+        except Exception:
+            logger.exception("Could not persist interrupted task state for %s", job.task_id)
+
+    def _report_progress(
+        self, job: Job, cancelled: Event, completed: int, total: int, phase: str
+    ) -> None:
+        # Runs in the scientific thread, never waits for the HTTP event loop.
+        if cancelled.is_set() or self._stopping or self.backend.is_cancel_requested(job):
+            cancelled.set()
+            raise SimulationCancelled("Simulation interrupted")
+        if not self.backend.report_progress(job, completed, total, phase):
+            cancelled.set()
+            raise SimulationCancelled("Task lease is no longer current")
 
     async def _execute(self, job: Job) -> None:
         cancelled = Event()
@@ -122,6 +162,7 @@ class QueueManager:
                     artifacts_dir=Path(self.settings.artifacts_dir),
                     tracker=self.tracker,
                     cancel_event=cancelled,
+                    progress_callback=partial(self._report_progress, job, cancelled),
                 )
                 computation = asyncio.get_running_loop().run_in_executor(
                     self._executor, context.run, function
@@ -132,14 +173,11 @@ class QueueManager:
                         raise FloatingPointError("Simulation produced a nonfinite result")
                 if result.get("task_id") != job.task_id or result.get("status") != "completed":
                     raise ValueError("Scientific result violates the task contract")
-                committed = await asyncio.to_thread(self.backend.finish, job, result)
-                if committed:
-                    self.telemetry.record_task("completed")
-                else:
+                committed = await self._finish(job, result)
+                if not committed:
                     logger.warning("Discarded result from an obsolete task lease")
         except SimulationCancelled:
-            await self._release(job)
-            self.telemetry.record_task("cancelled")
+            await self._cancel_or_release(job)
         except asyncio.CancelledError:
             cancelled.set()
             # An OS thread cannot be killed by cancelling its asyncio wrapper.
@@ -148,7 +186,7 @@ class QueueManager:
             if computation is None or computation.done():
                 if computation is not None and not computation.cancelled():
                     computation.exception()
-                await self._release(job)
+                await self._cancel_or_release(job)
             elif computation is not None:
                 computation.add_done_callback(
                     lambda future: future.exception() if not future.cancelled() else None
@@ -162,13 +200,10 @@ class QueueManager:
                 else "Simulation execution failed; inspect server logs"
             )
             try:
-                committed = await asyncio.to_thread(
-                    self.backend.finish,
+                await self._finish(
                     job,
                     {"task_id": job.task_id, "status": "failed", "error": message},
                 )
-                if committed:
-                    self.telemetry.record_task("failed")
             except Exception:
                 logger.exception("Could not persist failed task; lease will expire")
         finally:
