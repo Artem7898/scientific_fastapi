@@ -1,9 +1,10 @@
 """Validated application configuration; resources are created by the lifespan."""
 
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +13,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Scientific API"
     debug: bool = False
+    execution_mode: Literal["embedded", "api", "worker"] = "embedded"
     artifacts_dir: Path = Path("artifacts/runs")
     max_simulation_iterations: int = Field(default=10_000, ge=1, le=10_000)
     max_particle_steps: int = Field(default=100_000_000, ge=1, le=100_000_000)
@@ -22,6 +24,8 @@ class Settings(BaseSettings):
     task_lease_seconds: int = Field(default=30, ge=3, le=3600)
     max_task_attempts: int = Field(default=3, ge=1, le=100)
     shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    event_poll_interval_seconds: float = Field(default=0.25, gt=0, le=5)
+    sse_max_connections: int = Field(default=32, ge=1, le=1024)
 
     redis_uri: str = ""
     redis_namespace: str = Field(default="scientific-api", pattern=r"^[A-Za-z0-9:_-]+$")
@@ -32,6 +36,14 @@ class Settings(BaseSettings):
     otel_service_name: str = "scientific-api"
     otel_exporter_otlp_endpoint: str = ""
     otel_exporter_console: bool = False
+
+    @model_validator(mode="after")
+    def require_shared_backend_for_external_roles(self) -> "Settings":
+        if self.execution_mode != "embedded" and not self.redis_uri:
+            raise ValueError(
+                "EXECUTION_MODE=api or worker requires REDIS_URI for shared task state"
+            )
+        return self
 
     @field_validator("redis_uri")
     @classmethod

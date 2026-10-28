@@ -61,6 +61,32 @@ In `/docs`, select **Scientific Analysis → POST /api/v1/simulations/{task_id}/
 
 Two simultaneous analyses are allowed per API process by default; a busy service returns `429` with `Retry-After: 1`. This phase waits for completion over HTTP and has no persistent analysis queue. A disconnected request leaves its thread running and occupying capacity until completion; the client may lose its result URLs, and retrying POST creates a new analysis. See the [API reference](docs/api_reference.md) for source integrity checks, availability limits, and formats.
 
+## Progress and cancellation
+
+Server-Sent Events expose task progress. Existing polling through `check_url` continues to work:
+
+```bash
+curl -N http://localhost:8000/api/v1/simulations/TASK_ID/events
+curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/cancel
+```
+
+Cancellation returns `202` to acknowledge the request; check the eventual state through polling or SSE. Event history is bounded. On reconnect, send the last received `id` in `Last-Event-ID`; if replay history is unavailable, the stream reports a reset and the current state. Progress belongs to an execution attempt: recovery restarts from the saved seed, without a checkpoint.
+
+## Ensembles of independent replicas
+
+`POST /api/v1/ensembles` accepts one model and its parameters without `seed`, a replica count from `1..50`, and `base_seed`. For example:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/ensembles \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: temperature-study-001' \
+  -d '{"model":"ideal-gas-ou-v1","parameters":{"initial_temperature":300.0,"num_particles":1000,"num_steps":100},"replicas":4,"base_seed":42,"failure_policy":"require_all"}'
+```
+
+The `202` response includes `ensemble_id` and `check_url`. Read status through `GET /api/v1/ensembles/ENSEMBLE_ID`, request cancellation of remaining work through `POST /api/v1/ensembles/ENSEMBLE_ID/cancel`, and download `/api/v1/ensembles/ENSEMBLE_ID/manifest` after completion. These operations appear under **Ensembles** in `/docs`.
+
+All seeds are saved before execution, and admission reserves capacity for every replica atomically. The total budget counts `replicas * num_particles * num_steps`; existing workers execute the jobs. An optional `Idempotency-Key` returns the same ensemble on retry; conflicting parameters produce `409`. With `require_all`, failures and cancellations remain explicit and no survivor-only aggregate is reported. Sample SD (`ddof=1`) and the mean's SE require all replicas to succeed and `M >= 2`; both are `null` for one replica. These estimates across independent replicas differ from the single-snapshot theoretical error `T/sqrt(N)`.
+
 ## Reproducibility
 
 - Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
@@ -88,7 +114,15 @@ For example: `uv sync --frozen --extra redis --extra observability`. Redis, MLfl
 
 ## Execution and telemetry
 
-The default bounded in-memory queue supports local development in one process. Jobs and statuses are lost on restart, and independent processes do not share state. Enable `REDIS_URI` for shared state; acknowledgment, retries, and retention are described in the [architecture guide](docs/architecture.md).
+The default `EXECUTION_MODE=embedded` combines HTTP and computation with a bounded in-memory queue for local development in one process. Jobs and statuses are lost on restart, and independent processes do not share state. Enable `REDIS_URI` for shared state; acknowledgment, retries, and retention are described in the [architecture guide](docs/architecture.md).
+
+For separate execution, use `EXECUTION_MODE=api` for HTTP without simulation queue consumers and start independent processes with `EXECUTION_MODE=worker python -m scientific_api.worker`. Both roles require Redis and access to the same artifacts. API readiness checks its backend; it does not establish that a worker is running. Saved-state analysis still runs in the API's bounded pool. `WORKER_COUNT` is the consumer count per process, not a cluster-wide limit. Start the local Compose configuration with a separate worker using:
+
+When upgrading an existing deployment, stop admission and all old embedded API/worker processes using the Redis namespace first: running the old and new protocols together is unsupported. The [upgrade procedure](docs/development.md) preserves Redis and artifact volumes. For a new or already stopped deployment:
+
+```bash
+docker compose -f docker-compose.yml -f compose.worker.yml up --build
+```
 
 Use one Uvicorn worker with the in-memory queue. Multiple machines also need shared artifact storage: Redis does not share local files.
 

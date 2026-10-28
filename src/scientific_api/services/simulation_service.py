@@ -10,10 +10,12 @@ import platform
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from typing import Any
 
 import numpy as np
@@ -137,6 +139,7 @@ def run_simulation(
     attempt_id: str | None = None,
     tracker: ExperimentTracker | None = None,
     cancel_event: Event | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     """Compute a seeded trajectory and an auditable terminal-state artifact.
 
@@ -195,9 +198,17 @@ def run_simulation(
             seed=parameters.seed,
         )
         final_temperature, total_energy = simulator.observables()
-        for _ in range(parameters.num_steps):
+        last_progress = monotonic()
+        if progress_callback is not None:
+            progress_callback(0, parameters.num_steps, "computing")
+        for step in range(1, parameters.num_steps + 1):
             _check_cancelled(cancel_event)
             final_temperature, total_energy = simulator.step()
+            if progress_callback is not None:
+                now = monotonic()
+                if step == parameters.num_steps or now - last_progress >= 0.5:
+                    progress_callback(step, parameters.num_steps, "computing")
+                    last_progress = now
         _check_cancelled(cancel_event)
         uncertainty = parameters.initial_temperature / math.sqrt(parameters.num_particles)
         metrics = {
@@ -210,6 +221,9 @@ def run_simulation(
         if tracker is not None:
             tracker.log_metrics(metrics)
 
+        if progress_callback is not None:
+            progress_callback(parameters.num_steps, parameters.num_steps, "saving_artifacts")
+        _check_cancelled(cancel_event)
         state_path = run_dir / "final_state.npz"
         _write_state(state_path, simulator.velocities)
         relative_state = state_path.relative_to(artifacts_dir).as_posix()

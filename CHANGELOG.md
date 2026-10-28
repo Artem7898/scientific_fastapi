@@ -5,6 +5,11 @@
 - Analyze committed 2D velocity snapshots without rerunning the simulation, with Gaussian component and Rayleigh speed diagnostics.
 - Generate optional PNG and three-page PDF reports, with source checksums, versioned analysis provenance, atomic artifact publication, and bounded request capacity.
 - Preserve the simulation API and lightweight core; plotting requires the existing `research` extra.
+- Separate HTTP producers and standalone workers with explicit execution roles and a shared Redis queue/artifact configuration.
+- Add attempt-fenced task progress, bounded SSE replay, and cooperative cancellation without changing existing status polling.
+- Accept reproducible ensembles atomically with saved seed schedules, idempotent admission, retained child contributions, and explicit all-success uncertainty rules.
+- Preserve the OU physics and synchronous bounded-thread analysis API; recovery restarts from the seed rather than a checkpoint.
+- Require draining/stopping old embedded API and workers before the new API admits ensembles into the same Redis namespace; persisted records remain supported after the transition.
 
 ## 2.0.0
 
