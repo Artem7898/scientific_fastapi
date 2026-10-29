@@ -98,19 +98,17 @@ def benchmark_backend(
             except ImportError:
                 return {
                     "status": "skipped",
-                    "reason": "Install scientific-api[benchmark] for Numba",
+                    "reason": "Install scientific-api[numba] or scientific-api[benchmark] for Numba",
                 }
 
-            @numba.njit(cache=False, fastmath=False)
+            from scientific_api.models.numba_engine import update_velocities
+
             def compiled(initial, shocks, decay, amplitude):
+                # Reuse the production single-step kernel. Input generation is
+                # still deliberately excluded from this kernel-only benchmark.
                 velocities = initial.copy()
-                for step in range(shocks.shape[0]):
-                    for particle in range(velocities.shape[0]):
-                        for dimension in range(velocities.shape[1]):
-                            velocities[particle, dimension] = (
-                                decay * velocities[particle, dimension]
-                                + amplitude * shocks[step, particle, dimension]
-                            )
+                for shock in shocks:
+                    update_velocities(velocities, shock, decay, amplitude)
                 return velocities
 
             def execute() -> list[np.ndarray]:
@@ -118,6 +116,8 @@ def benchmark_backend(
 
             backend_metadata["version"] = numba.__version__
             backend_metadata["fastmath"] = False
+            backend_metadata["kernel"] = "production ou-numba-v1 single-step update"
+            backend_metadata["device_platforms"] = ["cpu"]
         elif name == "jax":
             try:
                 import jax
@@ -141,6 +141,15 @@ def benchmark_backend(
 
             backend_metadata["version"] = jax.__version__
             backend_metadata["devices"] = [str(device) for device in jax.devices()]
+            backend_metadata["device_platforms"] = sorted(
+                {device.platform for device in jax.devices()}
+            )
+            backend_metadata["gpu_available"] = any(
+                device.platform == "gpu" for device in jax.devices()
+            )
+            backend_metadata["scope"] = (
+                "experimental pre-generated kernel; not a production runtime backend"
+            )
             backend_metadata["float64"] = True
         else:
             raise ValueError(f"Unknown backend: {name}")

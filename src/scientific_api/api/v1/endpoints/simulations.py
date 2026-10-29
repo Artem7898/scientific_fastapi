@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 
 from ....core.queue_manager import QueueManager
 from ....core.task_store import QueueFull
+from ....models.computation import BackendUnavailable, require_backend
 from ....schemas.simulation import (
     SimulationRequest,
     TaskAcceptedResponse,
@@ -38,6 +39,10 @@ async def submit_simulation(
         raise HTTPException(422, "num_steps exceeds the configured iteration limit")
     if payload.num_particles * payload.num_steps > manager.settings.max_particle_steps:
         raise HTTPException(422, "Requested workload exceeds the configured particle-step limit")
+    try:
+        require_backend(payload.backend)
+    except BackendUnavailable as exc:
+        raise HTTPException(503, str(exc)) from None
     task_id = uuid.uuid4().hex
     try:
         await manager.submit(task_id, payload.model_dump())

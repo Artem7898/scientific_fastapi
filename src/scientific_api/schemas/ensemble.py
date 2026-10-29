@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import Field, FiniteFloat, StrictInt, model_validator
 
+from ..domain.simulation import ComputeBackend
 from .simulation import StrictModel
 
 
@@ -14,6 +15,7 @@ class EnsembleParameters(StrictModel):
     num_particles: StrictInt = Field(gt=0, le=1_000_000)
     time_step: FiniteFloat = Field(default=0.001, gt=0, le=1000)
     num_steps: StrictInt = Field(default=100, gt=0, le=10_000)
+    backend: ComputeBackend = "numpy"
 
 
 class EnsembleRequest(StrictModel):

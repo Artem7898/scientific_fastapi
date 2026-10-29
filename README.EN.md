@@ -39,6 +39,21 @@ The service responds with `202 Accepted`:
 
 Poll `check_url`. The same `task_id` passes through `pending`, `running`, and `completed` or `failed`/`cancelled`. A completed response includes temperature, energy, temperature standard error, model version, seed, and artifact references. See the [API reference](docs/api_reference.md) for the complete contract and limits.
 
+## Optional Numba execution
+
+NumPy remains the default and reference implementation. To use the CPU Numba backend, install its extra in the API environment and every worker consuming the same queue:
+
+```bash
+uv sync --frozen --extra numba
+uv run --no-sync uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
+```
+
+Include `"backend":"numba"` in the simulation request. For an ensemble, put the same field inside `parameters`; every replica uses that backend. Keep any other required extras in the `uv sync` command. Missing Numba produces `503` before admission; unknown backend names, including `jax`, produce `422`. Execution never silently switches to NumPy.
+
+Both implementations use float64 velocities and NumPy PCG64 noise generated one step at a time. Numba compiles the CPU update with `fastmath=False` and no internal parallel pool. The service calculates temperature and energy at the terminal step, while cancellation checks and progress updates retain step boundaries. The first Numba calculation in each process includes import and compilation costs; compilation is not cached on disk. The run manifest records the actual backend, implementation and kernel versions, dtype, device, and RNG policy in `execution`.
+
+Choose a backend using the [runtime benchmark](docs/development.md#benchmark) on the target machine. JAX remains an optional benchmark experiment; GPU execution is not an API backend. A GPU speedup requires a verified device and measurements that include data transfer and synchronization.
+
 ## Analyze a saved simulation
 
 After `status="completed"`, analyze the saved velocities without running another simulation. JSON analysis works with the minimal installation:
@@ -108,6 +123,7 @@ The minimal installation runs the API and NumPy model. Install integrations expl
 | `research` | saved-velocity PNG/PDF reports and research figures |
 | `notebooks` | Jupyter and notebook tooling |
 | `observability` | OpenTelemetry and telemetry export |
+| `numba` | optional Numba CPU execution for simulations and ensembles |
 | `benchmark` | additional computational backends for comparisons |
 
 For example: `uv sync --frozen --extra redis --extra observability`. Redis, MLflow, and OpenTelemetry adapters load when their integration is enabled. An empty `MLFLOW_TRACKING_URI` disables tracking.
@@ -131,7 +147,7 @@ After installing `observability`, set `OTEL_ENABLED=true` to connect HTTP reques
 ## Development
 
 ```bash
-uv sync --frozen --extra dev --extra research --extra redis --extra observability
+uv sync --frozen --extra dev --extra research --extra redis --extra observability --extra numba
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync pyright src/

@@ -1,6 +1,9 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_NUMBA: ${INSTALL_NUMBA:-false}
     restart: unless-stopped
     depends_on:
       redis:

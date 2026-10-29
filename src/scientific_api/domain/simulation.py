@@ -2,9 +2,11 @@
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 MODEL_VERSION = "ideal-gas-ou-v1"
 MAX_PARTICLE_STEPS = 100_000_000
+ComputeBackend = Literal["numpy", "numba"]
 
 
 class SimulationCancelled(RuntimeError):
@@ -25,8 +27,11 @@ class SimulationParameters:
     time_step: float = 0.001
     num_steps: int = 100
     seed: int = 0
+    backend: ComputeBackend = "numpy"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.backend, str) or self.backend not in {"numpy", "numba"}:
+            raise ValueError("backend must be numpy or numba")
         for name, maximum in (("initial_temperature", 1e6), ("time_step", 1000.0)):
             value = getattr(self, name)
             if (

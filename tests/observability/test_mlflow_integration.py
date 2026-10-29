@@ -74,7 +74,7 @@ async def test_parallel_runs_keep_provenance_artifacts_and_failure_status(
                 raise FloatingPointError("test numerical failure")
 
             monkeypatch.setattr(
-                "scientific_api.services.simulation_service.IdealGasSimulator.step",
+                "scientific_api.models.physics_engine.IdealGasSimulator.advance",
                 invalid_numerical_step,
             )
             failed_response = await client.post(

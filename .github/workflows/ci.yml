@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install reviewed dependency resolution
-        run: uv sync --frozen --extra dev --extra redis --extra tracking --extra research --extra observability
+        run: uv sync --frozen --extra dev --extra redis --extra tracking --extra research --extra observability --extra numba
       - name: Confirm lockfile matches package metadata
         run: uv lock --check
       - name: Lint and type check
@@ -55,6 +55,14 @@ jobs:
         run: uv run --frozen --no-sync python scripts/run_paper_pipeline.py --output-dir /tmp/paper-smoke --seed 42 --num-points 3 --num-particles 48 --num-steps 5
       - name: Check benchmark backends produce equivalent results
         run: uv run --frozen --no-sync python scripts/benchmark.py --particles 64 --steps 4 --repeats 2 --workers 2 --backends numpy,threads,processes --output /tmp/benchmark-smoke.json
+      - name: Verify the real NumPy and Numba runtime backends
+        run: uv run --frozen --no-sync python scripts/benchmark_runtime.py --particles 64 --steps 4 --repeats 2 --backends numpy,numba --require-backends --output /tmp/runtime-smoke.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-benchmark-${{ matrix.python }}
+          path: /tmp/runtime-smoke.json
+          if-no-files-found: ignore
       - name: Export a portable PEP 751 lock
         run: uv export --frozen --format pylock.toml --no-editable --no-emit-project --output-file /tmp/pylock.toml
       - name: Build distributions with the pinned backend
@@ -63,12 +71,13 @@ jobs:
         shell: bash
         run: |
           expected_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          source_checkout="$PWD"
           uv venv --python "${{ matrix.python }}" /tmp/scientific-wheel
           uv export --frozen --no-emit-project --output-file /tmp/scientific-core.txt
           uv pip install --python /tmp/scientific-wheel/bin/python --require-hashes -r /tmp/scientific-core.txt
           uv pip install --python /tmp/scientific-wheel/bin/python --no-deps dist/*.whl
           cd /tmp
-          EXPECTED_PACKAGE_VERSION="$expected_version" /tmp/scientific-wheel/bin/python -I -c "import os, scientific_api; from scientific_api.main import app; assert scientific_api.__version__ == os.environ['EXPECTED_PACKAGE_VERSION']; assert app is not None"
+          EXPECTED_PACKAGE_VERSION="$expected_version" /tmp/scientific-wheel/bin/python -I "$source_checkout/tests/packaging/probe_core_wheel.py"
       - name: Ensure frozen operations preserved the lock
         run: git diff --exit-code -- uv.lock
 
@@ -99,6 +108,17 @@ jobs:
           except urllib.error.HTTPError as error:
               assert error.code == 422
               assert isinstance(json.load(error)["detail"], list)
+          unavailable = urllib.request.Request(
+              base + "/api/v1/simulations/monte-carlo",
+              data=b'{"initial_temperature":1.0,"num_particles":4,"backend":"numba"}',
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              urllib.request.urlopen(unavailable, timeout=5)
+              raise AssertionError("The default image unexpectedly accepted optional Numba")
+          except urllib.error.HTTPError as error:
+              assert error.code == 503
+              assert "scientific-api[numba]" in json.load(error)["detail"]
           payload = {"initial_temperature": 300.0, "num_particles": 24, "num_steps": 3, "seed": 42}
           request = urllib.request.Request(
               base + "/api/v1/simulations/monte-carlo",
@@ -220,6 +240,67 @@ jobs:
       - name: Remove CI containers and generated volumes
         if: always()
         run: docker compose -f docker-compose.yml -f compose.worker.yml down --volumes
+
+  numba-container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the optional Numba runtime image
+        run: docker build --build-arg INSTALL_NUMBA=true --tag scientific-api:numba-ci .
+      - name: Verify compiled CPU execution as the image user
+        run: |
+          docker run --rm -i --entrypoint python scientific-api:numba-ci - <<'PYTHON'
+          import hashlib
+          import importlib.metadata
+          import importlib.util
+          import json
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          import numpy as np
+          import scientific_api
+          from scientific_api.domain.simulation import SimulationParameters
+          from scientific_api.services.simulation_service import run_simulation
+
+          assert importlib.util.find_spec("jax") is None
+          assert importlib.util.find_spec("jaxlib") is None
+          assert not os.access(Path(scientific_api.__file__).parent, os.W_OK)
+          states = {}
+          manifests = {}
+          with tempfile.TemporaryDirectory() as directory:
+              root = Path(directory)
+              for backend in ("numpy", "numba"):
+                  parameters = SimulationParameters(
+                      initial_temperature=1.0, num_particles=32, time_step=0.01,
+                      num_steps=6, seed=42, backend=backend,
+                  )
+                  result = run_simulation(
+                      parameters, task_id="container_" + backend,
+                      attempt_id="runtime", artifacts_dir=root,
+                  )
+                  assert result["status"] == "completed"
+                  state_path = root / result["artifacts"]["final_state"]
+                  with np.load(state_path, allow_pickle=False) as state:
+                      states[backend] = state["velocities"].copy()
+                  with (root / result["artifacts"]["manifest"]).open() as stream:
+                      manifest = json.load(stream)
+                  assert manifest["parameters"]["backend"] == backend
+                  assert manifest["execution"]["backend"] == backend
+                  assert hashlib.sha256(state_path.read_bytes()).hexdigest() == manifest["artifacts"][0]["sha256"]
+                  manifests[backend] = manifest
+              np.testing.assert_allclose(states["numba"], states["numpy"], rtol=1e-11, atol=1e-11)
+          execution = manifests["numba"]["execution"]
+          assert execution["backend_version"] == importlib.metadata.version("numba")
+          assert execution["llvmlite_version"] == importlib.metadata.version("llvmlite")
+          assert execution["llvm_version"]
+          assert execution["device"] == "cpu" and execution["dtype"] == "float64"
+          assert execution["fastmath"] is False and execution["parallel"] is False
+          assert execution["cache"] is False and execution["nogil"] is True
+          assert not any(name.split(".", 1)[0] in {"jax", "jaxlib"} for name in sys.modules)
+          print("Optional Numba image executes the real service and agrees with NumPy on CPU")
+          PYTHON
 
   optional-benchmarks:
     if: github.event_name == 'workflow_dispatch' && inputs.optional_benchmarks

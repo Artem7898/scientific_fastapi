@@ -1,0 +1,161 @@
+{
+  "backends": {
+    "jax": {
+      "device_platforms": [
+        "cpu"
+      ],
+      "devices": [
+        "cpu:0"
+      ],
+      "float64": true,
+      "gil_enabled": true,
+      "gpu_available": false,
+      "max_absolute_error": 1.2079226507921703e-13,
+      "median_seconds": 0.04629955599375535,
+      "p95_seconds": 0.051825120000285094,
+      "samples_seconds": [
+        0.041907948994776234,
+        0.05188505499972962,
+        0.05158538000250701,
+        0.04629955599375535,
+        0.04626255200128071
+      ],
+      "scope": "experimental pre-generated kernel; not a production runtime backend",
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "reference": "numpy",
+        "rtol": 1e-11
+      },
+      "version": "0.11.2",
+      "warmup_seconds": 0.5718281130102696
+    },
+    "numba": {
+      "device_platforms": [
+        "cpu"
+      ],
+      "fastmath": false,
+      "gil_enabled": true,
+      "kernel": "production ou-numba-v1 single-step update",
+      "max_absolute_error": 0.0,
+      "median_seconds": 0.008139708996168338,
+      "p95_seconds": 0.00859471880539786,
+      "samples_seconds": [
+        0.008701273007318377,
+        0.008058236999204382,
+        0.0075235549884382635,
+        0.008139708996168338,
+        0.008168501997715794
+      ],
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "reference": "numpy",
+        "rtol": 1e-11
+      },
+      "version": "0.68.0",
+      "warmup_seconds": 0.4511346380022587
+    },
+    "numpy": {
+      "gil_enabled": true,
+      "max_absolute_error": 0.0,
+      "median_seconds": 0.006229263992281631,
+      "p95_seconds": 0.006631426804233342,
+      "samples_seconds": [
+        0.0066901980026159436,
+        0.006185228994581848,
+        0.006229263992281631,
+        0.0061443579907063395,
+        0.006396342010702938
+      ],
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "reference": "numpy",
+        "rtol": 1e-11
+      },
+      "warmup_seconds": 0.006402251005056314
+    },
+    "processes": {
+      "gil_enabled": true,
+      "max_absolute_error": 0.0,
+      "median_seconds": 0.09991406300105155,
+      "p95_seconds": 0.18125537880114279,
+      "samples_seconds": [
+        0.20082492000074126,
+        0.10297721400274895,
+        0.09739379800157622,
+        0.09956020400568377,
+        0.09991406300105155
+      ],
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "reference": "numpy",
+        "rtol": 1e-11
+      },
+      "warmup_seconds": 0.33700835099443793
+    },
+    "threads": {
+      "gil_enabled": true,
+      "max_absolute_error": 0.0,
+      "median_seconds": 0.00428230500256177,
+      "p95_seconds": 0.005698781198589131,
+      "samples_seconds": [
+        0.004405237996252254,
+        0.006022166999173351,
+        0.004267983997124247,
+        0.004033997000078671,
+        0.00428230500256177
+      ],
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "reference": "numpy",
+        "rtol": 1e-11
+      },
+      "warmup_seconds": 0.004451606000657193
+    }
+  },
+  "environment": {
+    "cpu_count": 5,
+    "free_threaded_build": false,
+    "gil_enabled": true,
+    "gil_enabled_after_backends": true,
+    "implementation": "CPython",
+    "machine": "x86_64",
+    "numpy": "2.5.4",
+    "package_version": "2.0.0",
+    "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+    "python": "3.12.14",
+    "thread_limits": {
+      "MKL_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1"
+    }
+  },
+  "methodology": {
+    "excluded": "input generation, NumPy reference, numerical validation, warmup/compilation, worker shutdown",
+    "interpretation": "Local measurements only; skipped backends are not validated and are not performance results",
+    "parallelism": "NumPy, Numba and JAX process batches serially; threads/processes use workers concurrent batches",
+    "timed": "identical pre-generated inputs; process IPC and JAX device transfers/synchronization included"
+  },
+  "model_version": "ideal-gas-ou-v1",
+  "schema_version": 1,
+  "workload": {
+    "batch_seed_policy": "seed + batch_index",
+    "dtype": "float64",
+    "independent_batches": 2,
+    "input_bytes": 64640000,
+    "particle_steps_per_sample": 4000000,
+    "particles_per_batch": 20000,
+    "repeats": 5,
+    "rng": "PCG64",
+    "seed": 42,
+    "steps": 100,
+    "temperature": 300.0,
+    "time_step": 0.001
+  }
+}

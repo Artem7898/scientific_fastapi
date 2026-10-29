@@ -39,6 +39,21 @@ curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
 
 Опросите `check_url`. Один и тот же `task_id` проходит состояния `pending`, `running` и `completed` либо `failed`/`cancelled`. Результат включает оценку температуры, энергию, стандартную ошибку температуры, версию модели, seed и ссылки на артефакты. Полный контракт и ограничения — в [справочнике API](docs/api_reference.md).
 
+## Необязательное исполнение через Numba
+
+NumPy остаётся вариантом по умолчанию и эталонной реализацией. Для CPU-backend Numba установите extra в окружении API и каждого worker, работающего с той же очередью:
+
+```bash
+uv sync --frozen --extra numba
+uv run --no-sync uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
+```
+
+Добавьте `"backend":"numba"` в запрос симуляции. Для ансамбля поместите поле внутрь `parameters`: этот backend используют все реплики. Сохраняйте другие нужные extras в команде `uv sync`. При отсутствии Numba запрос получает `503` до постановки в очередь; неизвестные имена backend, включая `jax`, дают `422`. Скрытого перехода на NumPy при ошибке исполнения нет.
+
+Обе реализации используют скорости float64 и шум NumPy PCG64, генерируемый по одному шагу. Numba компилирует CPU-обновление с `fastmath=False` и без собственного параллельного пула. Сервис рассчитывает температуру и энергию в конечном состоянии, сохраняя проверки отмены и обновления прогресса на границах шагов. Первый расчёт Numba в каждом процессе включает импорт и компиляцию; дисковый кеш компиляции отключён. Раздел `execution` manifest сохраняет фактический backend, версии реализации и ядра, dtype, устройство и политику RNG.
+
+Выбирайте backend по [runtime benchmark](docs/development.md#benchmark) на целевой машине. JAX остаётся отдельным необязательным benchmark-экспериментом; GPU-backend в API не включён. Ускорение на GPU требует подтверждённого устройства и замеров с передачей данных и синхронизацией.
+
 ## Анализ сохранённого расчёта
 
 После `status="completed"` можно исследовать сохранённые скорости без повторного запуска симуляции. JSON-анализ работает в минимальной установке:
@@ -108,6 +123,7 @@ curl -X POST http://localhost:8000/api/v1/ensembles \
 | `research` | PNG/PDF анализа сохранённых скоростей и исследовательские графики |
 | `notebooks` | Jupyter и инструменты notebook |
 | `observability` | OpenTelemetry и экспорт телеметрии |
+| `numba` | необязательное CPU-исполнение симуляций и ансамблей через Numba |
 | `benchmark` | дополнительные вычислительные backend для сравнений |
 
 Например, `uv sync --frozen --extra redis --extra observability`. Адаптеры Redis, MLflow и OpenTelemetry загружаются при включении соответствующей функции. Пустой `MLFLOW_TRACKING_URI` отключает tracking.
@@ -131,7 +147,7 @@ OpenTelemetry включается через `OTEL_ENABLED=true` после у�
 ## Разработка и проверка
 
 ```bash
-uv sync --frozen --extra dev --extra research --extra redis --extra observability
+uv sync --frozen --extra dev --extra research --extra redis --extra observability --extra numba
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync pyright src/

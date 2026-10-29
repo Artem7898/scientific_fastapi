@@ -195,14 +195,13 @@ def test_cancellation_during_a_run_ends_tracking_without_publishing(
 ) -> None:
     event = Event()
     tracker = RecordingTracker()
-    original_step = IdealGasSimulator.step
+    original_advance = IdealGasSimulator.advance
 
-    def cancel_after_step(simulator: IdealGasSimulator) -> tuple[float, float]:
-        result = original_step(simulator)
+    def cancel_after_step(simulator: IdealGasSimulator) -> None:
+        original_advance(simulator)
         event.set()
-        return result
 
-    monkeypatch.setattr(IdealGasSimulator, "step", cancel_after_step)
+    monkeypatch.setattr(IdealGasSimulator, "advance", cancel_after_step)
     with pytest.raises(SimulationCancelled):
         run_simulation(
             SimulationParameters(300.0, 10),

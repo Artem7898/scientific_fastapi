@@ -70,7 +70,7 @@ def test_simulation_async_workflow(client, tmp_path):
     manifest_response = client.get(f"/api/v1/simulations/{accepted['task_id']}/artifacts/manifest")
     assert manifest_response.status_code == 200
     manifest = manifest_response.json()
-    assert manifest["parameters"] == PAYLOAD
+    assert manifest["parameters"] == {**PAYLOAD, "backend": "numpy"}
     assert manifest["outputs"] == result
     state_response = client.get(f"/api/v1/simulations/{accepted['task_id']}/artifacts/final_state")
     assert state_response.status_code == 200
