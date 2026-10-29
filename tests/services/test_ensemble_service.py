@@ -1,6 +1,8 @@
 """Deterministic replica streams and statistics over logical contributions."""
 
 import copy
+import hashlib
+import json
 import math
 
 import numpy as np
@@ -70,6 +72,31 @@ def test_seed_materialization_and_request_fingerprint_are_independent_of_ids_and
     assert len(set(expected)) == 3
     np.testing.assert_array_equal(before[1], after[1])
     assert before[2:] == after[2:]
+
+
+def test_backend_is_persisted_and_idempotency_preserves_legacy_numpy_fingerprint():
+    request = EnsembleRequest.model_validate(PAYLOAD)
+    numpy_children, numpy_metadata = prepare_ensemble(request, ensemble_id="numpy-run")
+    legacy_request = request.model_dump()
+    del legacy_request["parameters"]["backend"]
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(legacy_request, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    assert numpy_metadata["request_fingerprint"] == legacy_fingerprint
+    assert numpy_metadata["request"]["parameters"]["backend"] == "numpy"
+    assert all(parameters["backend"] == "numpy" for _, parameters in numpy_children)
+    numba_request = request.model_copy(
+        update={"parameters": request.parameters.model_copy(update={"backend": "numba"})}
+    )
+    numba_children, numba_metadata = prepare_ensemble(numba_request, ensemble_id="numba-run")
+    assert numba_metadata["request_fingerprint"] != legacy_fingerprint
+    assert numba_metadata["request"]["parameters"]["backend"] == "numba"
+    assert all(parameters["backend"] == "numba" for _, parameters in numba_children)
+    assert [parameters["seed"] for _, parameters in numpy_children] == [
+        parameters["seed"] for _, parameters in numba_children
+    ]
 
 
 def test_statistics_use_sample_sd_and_replica_order_and_preserve_inputs():

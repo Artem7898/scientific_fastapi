@@ -1,11 +1,24 @@
 """Reference equilibrium thermostat, with an exact stochastic transition."""
 
 import math
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..domain.simulation import SimulationParameters
+
+
+def update_velocities(
+    velocities: NDArray[np.float64],
+    shocks: NDArray[np.float64],
+    decay: float,
+    noise_scale: float,
+) -> None:
+    """Reference in-place transition on supplied noise, without RNG or reduction."""
+    with np.errstate(over="raise", invalid="raise"):
+        velocities *= decay
+        velocities += noise_scale * shocks
 
 
 class IdealGasSimulator:
@@ -48,7 +61,32 @@ class IdealGasSimulator:
 
     def step(self) -> tuple[float, float]:
         """Advance one exact OU transition and return terminal observables."""
-        with np.errstate(over="raise", invalid="raise"):
-            self.velocities *= self._decay
-            self.velocities += self._noise_scale * self.rng.standard_normal(self.velocities.shape)
+        self.advance()
         return self.observables()
+
+    def advance(self) -> None:
+        """Advance once, retaining only current state and a single noise array.
+
+        The execution service samples observables at the terminal state. The
+        public ``step`` method keeps its previous per-step reduction contract.
+        """
+        update_velocities(
+            self.velocities,
+            self.rng.standard_normal(self.velocities.shape),
+            self._decay,
+            self._noise_scale,
+        )
+
+    def execution_metadata(self) -> dict[str, Any]:
+        """Describe the implementation independently of the physical model."""
+        return {
+            "backend": "numpy",
+            "backend_version": np.__version__,
+            "kernel_version": "ou-numpy-v1",
+            "device": "cpu",
+            "dtype": "float64",
+            "fastmath": False,
+            "parallel": False,
+            "rng_policy": "numpy-pcg64-per-step-v1",
+            "observables_schedule": "terminal",
+        }

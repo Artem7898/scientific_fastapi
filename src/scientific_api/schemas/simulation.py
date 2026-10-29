@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model_validator
 
-from ..domain.simulation import SimulationParameters
+from ..domain.simulation import ComputeBackend, SimulationParameters
 
 
 class StrictModel(BaseModel):
@@ -24,6 +24,7 @@ class SimulationRequest(StrictModel):
     )
     num_steps: StrictInt = Field(default=100, gt=0, le=10_000)
     seed: StrictInt = Field(default=0, ge=0, le=2**64 - 1)
+    backend: ComputeBackend = "numpy"
 
     @model_validator(mode="after")
     def bound_work(self) -> "SimulationRequest":

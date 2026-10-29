@@ -6,7 +6,10 @@ services:
       EXECUTION_MODE: api
 
   worker:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_NUMBA: ${INSTALL_NUMBA:-false}
     command: ["python", "-m", "scientific_api.worker"]
     restart: unless-stopped
     stop_grace_period: 15s

@@ -1,0 +1,324 @@
+{
+  "backends": {
+    "numba": {
+      "cold_run": {
+        "environment_capture_seconds": 0.010731240996392444,
+        "manifest_persistence_seconds": 0.0004383909981697798,
+        "state_persistence_seconds": 0.5650891739933286,
+        "wall_seconds": 1.5197807160002412
+      },
+      "environment": {
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "ab6f73c72194c1fe4a9c901ac7b633b2eb98517a",
+        "source_dirty": true,
+        "source_sha256": "5ba42fd3bf233bdfed4b851153f96472d967486a76f2475945e1d71042cb60a8",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numba",
+        "backend_version": "0.68.0",
+        "cache": false,
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "kernel_version": "ou-numba-v1",
+        "llvm_version": "22.1.0",
+        "llvmlite_version": "0.50.0",
+        "nogil": true,
+        "observables_schedule": "terminal",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-per-step-v1"
+      },
+      "measured_speedup_over_numpy": {
+        "warm_evolution": 1.1313786783705115,
+        "warm_full_run": 1.0617705727390945
+      },
+      "peak_worker_rss_bytes": 295579648,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "final_array_sha256": "318f65c8519898af5573723bed72c0de090a524717cc2f9d6c318209a3ccfb19",
+        "max_absolute_velocity_error": 0.0,
+        "reference": "numpy",
+        "rtol": 1e-11,
+        "same_backend_repeatability": "exact final arrays"
+      },
+      "warm_full_run": {
+        "environment_capture_seconds": {
+          "median_seconds": 0.008320604989421554,
+          "p95_seconds": 0.009387108002556488,
+          "samples_seconds": [
+            0.009591209003701806,
+            0.008570703997975215,
+            0.008133512994390912,
+            0.008320604989421554,
+            0.008113951989798807
+          ]
+        },
+        "manifest_persistence_seconds": {
+          "median_seconds": 0.0003481470048427582,
+          "p95_seconds": 0.00043395360989961773,
+          "samples_seconds": [
+            0.00034739500551950186,
+            0.0003481470048427582,
+            0.00031567800033371896,
+            0.0004498370108194649,
+            0.00037042000622022897
+          ]
+        },
+        "state_persistence_seconds": {
+          "median_seconds": 0.5290945470042061,
+          "p95_seconds": 0.554975572990952,
+          "samples_seconds": [
+            0.5282744950091001,
+            0.5266175750002731,
+            0.5290945470042061,
+            0.5347984489926603,
+            0.560019853990525
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 1.0234907529957127,
+          "p95_seconds": 1.0751140227890574,
+          "samples_seconds": [
+            1.0270536619937047,
+            1.0234907529957127,
+            1.0091128740023123,
+            1.0180564149923157,
+            1.0871291129878955
+          ]
+        }
+      },
+      "warm_profile": {
+        "evolution_including_rng_seconds": {
+          "median_seconds": 0.4488498189894017,
+          "p95_seconds": 0.5095965113956481,
+          "samples_seconds": [
+            0.44629545700445306,
+            0.5239969139947789,
+            0.4488498189894017,
+            0.43637844899785705,
+            0.4519949009991251
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.02328317498904653,
+          "p95_seconds": 0.02337943199381698,
+          "samples_seconds": [
+            0.02328317498904653,
+            0.022585560000152327,
+            0.021986621010000817,
+            0.023299528009374626,
+            0.023399407989927568
+          ]
+        },
+        "rng_only_seconds": {
+          "median_seconds": 0.41301502598798834,
+          "p95_seconds": 0.44117977539717684,
+          "samples_seconds": [
+            0.4215760649967706,
+            0.41301502598798834,
+            0.39243083700421266,
+            0.40137684901128523,
+            0.4460807029972784
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 0.0010599609959172085,
+          "p95_seconds": 0.0012470662011764943,
+          "samples_seconds": [
+            0.0010091379954246804,
+            0.0012091950047761202,
+            0.0010599609959172085,
+            0.0009562479972373694,
+            0.001256534000276588
+          ]
+        }
+      }
+    },
+    "numpy": {
+      "cold_run": {
+        "environment_capture_seconds": 0.012826846999814734,
+        "manifest_persistence_seconds": 0.0008003880066098645,
+        "state_persistence_seconds": 0.5668008840002585,
+        "wall_seconds": 1.1941332999995211
+      },
+      "environment": {
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "ab6f73c72194c1fe4a9c901ac7b633b2eb98517a",
+        "source_dirty": true,
+        "source_sha256": "5ba42fd3bf233bdfed4b851153f96472d967486a76f2475945e1d71042cb60a8",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numpy",
+        "backend_version": "2.5.4",
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "kernel_version": "ou-numpy-v1",
+        "observables_schedule": "terminal",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-per-step-v1"
+      },
+      "measured_speedup_over_numpy": {
+        "warm_evolution": 1.0,
+        "warm_full_run": 1.0
+      },
+      "peak_worker_rss_bytes": 158429184,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-11,
+        "final_array_sha256": "318f65c8519898af5573723bed72c0de090a524717cc2f9d6c318209a3ccfb19",
+        "max_absolute_velocity_error": 0.0,
+        "reference": "numpy",
+        "rtol": 1e-11,
+        "same_backend_repeatability": "exact final arrays"
+      },
+      "warm_full_run": {
+        "environment_capture_seconds": {
+          "median_seconds": 0.00903711499995552,
+          "p95_seconds": 0.009384276991477236,
+          "samples_seconds": [
+            0.00938977899204474,
+            0.009362268989207223,
+            0.00903711499995552,
+            0.008607466996181756,
+            0.007982884999364614
+          ]
+        },
+        "manifest_persistence_seconds": {
+          "median_seconds": 0.00031038800079841167,
+          "p95_seconds": 0.0003961623937357217,
+          "samples_seconds": [
+            0.00031353600206784904,
+            0.0004168189916526899,
+            0.0003037709975615144,
+            0.00030311000591609627,
+            0.00031038800079841167
+          ]
+        },
+        "state_persistence_seconds": {
+          "median_seconds": 0.5304786780034192,
+          "p95_seconds": 0.5629646783927456,
+          "samples_seconds": [
+            0.5230518790049246,
+            0.5304786780034192,
+            0.5673818819923326,
+            0.5452958639943972,
+            0.519182585994713
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 1.0867123630014248,
+          "p95_seconds": 1.1072733258042717,
+          "samples_seconds": [
+            1.0867123630014248,
+            1.094555253002909,
+            1.0810746570059564,
+            1.1104528440046124,
+            1.021336366989999
+          ]
+        }
+      },
+      "warm_profile": {
+        "evolution_including_rng_seconds": {
+          "median_seconds": 0.5078191149950726,
+          "p95_seconds": 0.5465131798031507,
+          "samples_seconds": [
+            0.463970443001017,
+            0.555335440003546,
+            0.5078191149950726,
+            0.4839543369889725,
+            0.5112241390015697
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.023016111998003908,
+          "p95_seconds": 0.023730453199823386,
+          "samples_seconds": [
+            0.023658022008021362,
+            0.022383221992640756,
+            0.02240446300129406,
+            0.023748560997773893,
+            0.023016111998003908
+          ]
+        },
+        "rng_only_seconds": {
+          "median_seconds": 0.42456574500829447,
+          "p95_seconds": 0.46914087400364224,
+          "samples_seconds": [
+            0.4508838899928378,
+            0.42456574500829447,
+            0.4038548520038603,
+            0.47370512000634335,
+            0.405819834995782
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 0.0010057539911940694,
+          "p95_seconds": 0.0019891647942131383,
+          "samples_seconds": [
+            0.0009156099986284971,
+            0.0010159200028283522,
+            0.0009192249999614432,
+            0.002232475992059335,
+            0.0010057539911940694
+          ]
+        }
+      }
+    }
+  },
+  "benchmark": "production-runtime",
+  "environment": {
+    "cpu_affinity_count": 5,
+    "cpu_count": 5,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "cpu_quota_cores": 4.0,
+    "free_threaded_build": false,
+    "numpy": "2.5.4",
+    "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+    "python": "3.12.14",
+    "thread_limits": {
+      "MKL_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1"
+    }
+  },
+  "methodology": {
+    "cold_run": "First service call in that process, including optional import/JIT; common Python/NumPy/service imports and interpreter startup excluded",
+    "excluded": "HTTP, queue wait, Redis, SSE, tracking, remote storage, child startup and artifact reads/numerical validation",
+    "interpretation": "Local measurements on one CPU; skipped backends have no performance result; p95 over small samples is descriptive",
+    "isolation": "One fresh child process per backend; no concurrent benchmark workloads",
+    "memory": "No pre-generated steps-by-particles noise; peak RSS is whole child process including imports/reference/validation; not incremental engine allocation",
+    "validation": "Persisted arrays and final observables checked outside timing; every warm run repeats the same seed exactly; numerical cross-backend tolerance is not a physical validation",
+    "warm_full_run": "Real run_simulation including PCG64, evolution, final observables, checksums, environment capture, compressed NPZ/manifest and fsync; no tracking",
+    "warm_profile": "Separate initialized engine runs with per-stage timers, not a decomposition of full-run samples; RNG-only is a separate diagnostic, not additive"
+  },
+  "model_version": "ideal-gas-ou-v1",
+  "schema_version": 1,
+  "workload": {
+    "initial_temperature": 300.0,
+    "num_particles": 1000000,
+    "num_steps": 20,
+    "particle_steps_per_run": 20000000,
+    "repeats": 5,
+    "seed": 42,
+    "time_step": 0.001,
+    "velocity_array_bytes": 16000000
+  }
+}

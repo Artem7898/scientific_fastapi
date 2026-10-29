@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from ....core.queue_manager import QueueManager
 from ....core.task_store import QueueFull
+from ....models.computation import BackendUnavailable, require_backend
 from ....schemas.ensemble import (
     EnsembleAccepted,
     EnsembleCancellation,
@@ -47,6 +48,10 @@ async def submit_ensemble(
         > manager.settings.max_particle_steps
     ):
         raise HTTPException(422, "Ensemble exceeds the configured total particle-step limit")
+    try:
+        require_backend(parameters.backend)
+    except BackendUnavailable as exc:
+        raise HTTPException(503, str(exc)) from None
     ensemble_id = uuid.uuid4().hex
     try:
         with manager.telemetry.span(

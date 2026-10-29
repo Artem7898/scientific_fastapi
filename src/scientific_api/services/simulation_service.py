@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 
 from ..core.experiment_tracker import ExperimentTracker
 from ..domain.simulation import MODEL_VERSION, SimulationCancelled, SimulationParameters
-from ..models.physics_engine import IdealGasSimulator
+from ..models.computation import create_simulator
 
 logger = logging.getLogger(__name__)
 
@@ -191,25 +191,23 @@ def run_simulation(
                     **({"attempt_id": attempt_id} if attempt_id is not None else {}),
                 }
             )
-        simulator = IdealGasSimulator(
-            num_particles=parameters.num_particles,
-            initial_temp=parameters.initial_temperature,
-            dt=parameters.time_step,
-            seed=parameters.seed,
-        )
-        final_temperature, total_energy = simulator.observables()
+        simulator = create_simulator(parameters)
         last_progress = monotonic()
         if progress_callback is not None:
             progress_callback(0, parameters.num_steps, "computing")
         for step in range(1, parameters.num_steps + 1):
             _check_cancelled(cancel_event)
-            final_temperature, total_energy = simulator.step()
+            simulator.advance()
             if progress_callback is not None:
                 now = monotonic()
                 if step == parameters.num_steps or now - last_progress >= 0.5:
                     progress_callback(step, parameters.num_steps, "computing")
                     last_progress = now
         _check_cancelled(cancel_event)
+        # The workflow publishes a terminal snapshot. Intermediate reductions
+        # did not contribute to the result; retain every stochastic transition
+        # and cancellation boundary, but calculate observables only once.
+        final_temperature, total_energy = simulator.observables()
         uncertainty = parameters.initial_temperature / math.sqrt(parameters.num_particles)
         metrics = {
             "final_temperature": final_temperature,
@@ -247,6 +245,7 @@ def run_simulation(
             "attempt_id": attempt_id,
             "created_at": datetime.now(UTC).isoformat(),
             "parameters": asdict(parameters),
+            "execution": simulator.execution_metadata(),
             "outputs": result,
             "model": {
                 "version": MODEL_VERSION,

@@ -33,9 +33,17 @@ def prepare_ensemble(
     if not valid_ensemble_id(ensemble_id) or len(ensemble_id) > 100:
         raise ValueError("Invalid ensemble identifier")
     canonical_request = request.model_dump()
+    # Adding an explicit default must not invalidate keys accepted before
+    # backend selection existed. NumPy is the same experiment when omitted.
+    fingerprint_request = {
+        **canonical_request,
+        "parameters": dict(canonical_request["parameters"]),
+    }
+    if fingerprint_request["parameters"]["backend"] == "numpy":
+        del fingerprint_request["parameters"]["backend"]
     fingerprint = hashlib.sha256(
         json.dumps(
-            canonical_request, sort_keys=True, separators=(",", ":"), allow_nan=False
+            fingerprint_request, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
     ).hexdigest()
     root = np.random.SeedSequence(request.base_seed)

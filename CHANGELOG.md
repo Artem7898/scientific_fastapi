@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add an explicit optional Numba CPU backend for simulations and ensembles, with persisted backend selection, lazy loading, and no implicit fallback from failed execution.
+- Keep NumPy as the default reference and PCG64 innovations common to both implementations; record backend/kernel versions, device, dtype, arithmetic, and RNG policy in run manifests.
+- Sample terminal observables without redundant per-step reductions, while retaining step-boundary cancellation and progress behavior.
+- Add cold/warm benchmarks of the actual runtime and artifact path, numerical equivalence and repeatability checks, and mandatory optional-backend CI alongside core-only installation checks.
+- Preserve default-NumPy ensemble idempotency across upgrades; stop older consumers before admitting payloads with backend selection, and preserve Redis/artifact volumes during the rollout.
 - Analyze committed 2D velocity snapshots without rerunning the simulation, with Gaussian component and Rayleigh speed diagnostics.
 - Generate optional PNG and three-page PDF reports, with source checksums, versioned analysis provenance, atomic artifact publication, and bounded request capacity.
 - Preserve the simulation API and lightweight core; plotting requires the existing `research` extra.

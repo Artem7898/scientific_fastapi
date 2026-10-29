@@ -217,7 +217,13 @@ def test_cli_configuration_error_does_not_echo_credentials(tmp_path: Path) -> No
     not os.environ.get("SCIENTIFIC_TEST_REDIS_URI"),
     reason="SCIENTIFIC_TEST_REDIS_URI is not configured",
 )
-def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend_name", ["numpy", "numba"])
+def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
+    tmp_path: Path, backend_name: str
+) -> None:
+    if backend_name == "numba":
+        pytest.importorskip("numba")
+    payload = {**PAYLOAD, "backend": backend_name}
     redis = pytest.importorskip("redis")
     uri = os.environ["SCIENTIFIC_TEST_REDIS_URI"]
     namespace = "scientific-api-external-worker-" + uuid4().hex
@@ -240,7 +246,7 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_pat
     try:
         with TestClient(create_app(settings)) as client:
             assert not client.app.state.queue_manager.ready
-            accepted = client.post("/api/v1/simulations/monte-carlo", json=PAYLOAD).json()
+            accepted = client.post("/api/v1/simulations/monte-carlo", json=payload).json()
             assert client.get(accepted["check_url"]).json()["status"] == "pending"
             pending = client.app.state.backend.events(accepted["task_id"])
             assert pending["snapshot"]["phase"] == "pending"
@@ -253,7 +259,7 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_pat
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 assert process.poll() is None, process.communicate(timeout=2)[0]
                 response = client.get(accepted["check_url"])
@@ -269,6 +275,8 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_pat
             artifact = client.get(f"/api/v1/simulations/{result['task_id']}/artifacts/manifest")
             assert artifact.status_code == 200
             assert artifact.json()["outputs"] == result
+            assert artifact.json()["parameters"]["backend"] == backend_name
+            assert artifact.json()["execution"]["backend"] == backend_name
 
             # A fresh API instance reads durable events and results produced by
             # the separate worker process, rather than relying on local state.
@@ -293,7 +301,7 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_pat
                     "/api/v1/ensembles",
                     json={
                         "parameters": {
-                            key: value for key, value in PAYLOAD.items() if key != "seed"
+                            key: value for key, value in payload.items() if key != "seed"
                         },
                         "replicas": 3,
                         "base_seed": 42,
@@ -324,6 +332,8 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(tmp_pat
                     )
                     assert committed.status_code == 200
                     assert committed.json()["outputs"] == child
+                    assert committed.json()["parameters"]["backend"] == backend_name
+                    assert committed.json()["execution"]["backend"] == backend_name
             process.terminate()
             output, _ = process.communicate(timeout=10)
             assert process.returncode == 0, output
