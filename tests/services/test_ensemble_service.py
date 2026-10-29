@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from scientific_api.schemas.ensemble import EnsembleRequest
+from scientific_api.schemas.lennard_jones import LennardJonesEnsembleParameters
 from scientific_api.services.ensemble_service import (
     aggregate_ensemble,
     ensemble_manifest,
@@ -303,4 +304,110 @@ def test_langevin_ensemble_caps_aggregate_sampled_trajectory_bytes_before_alloca
                 "parameters": {**parameters, "num_particles": 524_289},
                 "replicas": 16,
             }
+        )
+
+
+def test_lj_model_selects_its_default_parameter_class_before_overlapping_union_fields():
+    request = EnsembleRequest.model_validate(
+        {"model": "lennard-jones-2d-v1", "parameters": {}, "replicas": 2}
+    )
+    assert isinstance(request.parameters, LennardJonesEnsembleParameters)
+    children, metadata = prepare_ensemble(request, ensemble_id="lj-defaults")
+    assert metadata["request"]["parameters"]["num_particles"] == 64
+    assert all(payload["model"] == "lennard-jones-2d-v1" for _, payload in children)
+
+
+def test_lj_nvt_normalization_makes_default_and_explicit_rates_idempotent():
+    payload = {
+        "model": "lennard-jones-2d-v1",
+        "parameters": {"ensemble": "nvt", "bath_temperature": 0.7},
+        "replicas": 2,
+    }
+    implicit = EnsembleRequest.model_validate(payload)
+    explicit = EnsembleRequest.model_validate(
+        {**payload, "parameters": {**payload["parameters"], "friction": 1.0}}
+    )
+    first_children, first_metadata = prepare_ensemble(implicit, ensemble_id="implicit")
+    second_children, second_metadata = prepare_ensemble(explicit, ensemble_id="explicit")
+    assert first_metadata == second_metadata
+    assert [item[1] for item in first_children] == [item[1] for item in second_children]
+    assert first_metadata["request"]["parameters"]["friction"] == 1.0
+
+
+def test_lj_ensemble_statistics_keep_signed_metrics_without_free_particle_error_formula():
+    request = EnsembleRequest.model_validate(
+        {"model": "lennard-jones-2d-v1", "parameters": {}, "replicas": 2}
+    )
+    children, metadata = prepare_ensemble(request, ensemble_id="lj-statistics")
+    source = {
+        "ensemble_id": "lj-statistics",
+        "metadata": metadata,
+        "children": [identifier for identifier, _ in children],
+        "results": {
+            identifier: {
+                "task_id": identifier,
+                "status": "completed",
+                "seed": payload["seed"],
+                "thermal_temperature": 0.5 + index,
+                "kinetic_energy": 4.0 + index,
+                "potential_energy": -10.0 - index,
+                "total_energy": -6.0,
+                "pressure": -0.2 - 0.1 * index,
+            }
+            for index, (identifier, payload) in enumerate(children)
+        },
+    }
+    result = aggregate_ensemble(source)
+    assert result["status"] == "completed"
+    assert result["theoretical_temperature_standard_error"] is None
+    assert result["statistics"]["potential_energy"] == {
+        "n": 2,
+        "mean": -10.5,
+        "sample_standard_deviation": math.sqrt(0.5),
+        "standard_error": 0.5,
+    }
+    assert result["statistics"]["pressure"]["mean"] < 0
+    assert result["statistics"]["total_energy"]["mean"] == -6.0
+    assert (
+        "interacting"
+        in ensemble_manifest(source)["statistics_method"]["theoretical_temperature_standard_error"]
+    )
+
+
+@pytest.mark.parametrize(
+    "parameters,replicas,reason",
+    [
+        (
+            {
+                "num_particles": 512,
+                "box_size": (32.0, 32.0),
+                "num_steps": 700,
+                "interaction_backend": "direct",
+            },
+            2,
+            "100000000",
+        ),
+        (
+            {
+                "num_particles": 4096,
+                "box_size": (72.0, 72.0),
+                "num_steps": 1000,
+                "sample_stride": 1000,
+            },
+            6,
+            "20000000",
+        ),
+        (
+            {"num_particles": 4096, "box_size": (72.0, 72.0), "num_steps": 300, "sample_stride": 1},
+            28,
+            "512 MiB",
+        ),
+    ],
+)
+def test_lj_ensemble_bounds_total_pair_work_particle_steps_and_trajectory_bytes(
+    parameters, replicas, reason
+):
+    with pytest.raises(ValidationError, match=reason):
+        EnsembleRequest.model_validate(
+            {"model": "lennard-jones-2d-v1", "parameters": parameters, "replicas": replicas}
         )

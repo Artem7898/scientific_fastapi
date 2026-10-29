@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model
 
 from ..domain.simulation import ComputeBackend, SimulationParameters
 from .langevin import LangevinResponse
+from .lennard_jones import LennardJonesResponse
 
 
 class StrictModel(BaseModel):
@@ -69,7 +70,8 @@ class TaskFailed(StrictModel):
 
 
 CompletedSimulationResponse = Annotated[
-    SimulationResponse | LangevinResponse, Field(discriminator="model_version")
+    SimulationResponse | LangevinResponse | LennardJonesResponse,
+    Field(discriminator="model_version"),
 ]
 TaskStatusResponse = Annotated[
     TaskInProgress | CompletedSimulationResponse | TaskFailed, Field(discriminator="status")

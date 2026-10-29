@@ -6,6 +6,7 @@ import pytest
 
 from scientific_api.domain.experiments import parameters_from_payload
 from scientific_api.domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
+from scientific_api.domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from scientific_api.domain.simulation import MODEL_VERSION, SimulationParameters
 
 
@@ -23,6 +24,15 @@ def test_langevin_json_payload_retains_pairs_model_seed_and_sampling():
     )
     payload = {"model": LANGEVIN_MODEL_VERSION, **asdict(parameters)}
     payload["acceleration"] = [0.5, -0.25]
+    assert parameters_from_payload(payload) == parameters
+
+
+def test_lj_json_payload_retains_ensemble_interactions_and_seed():
+    parameters = LennardJonesParameters(
+        num_particles=16, seed=2**64 - 1, ensemble="nvt", bath_temperature=1.5
+    )
+    payload = {"model": LJ_MODEL_VERSION, **asdict(parameters)}
+    payload["box_size"] = list(parameters.box_size)
     assert parameters_from_payload(payload) == parameters
 
 

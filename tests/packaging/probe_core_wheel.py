@@ -19,6 +19,7 @@ def main() -> None:
 
     import scientific_api
     from scientific_api.domain.langevin import LangevinParameters
+    from scientific_api.domain.lennard_jones import LennardJonesParameters
     from scientific_api.domain.simulation import SimulationParameters
     from scientific_api.main import app
     from scientific_api.models.computation import (
@@ -27,6 +28,8 @@ def main() -> None:
         require_backend,
     )
     from scientific_api.models.langevin_engine import create_langevin_simulator
+    from scientific_api.models.lennard_jones_engine import create_lj_simulator
+    from scientific_api.research.lj_analysis import analyze_lj_observables
     from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
     from scientific_api.services.simulation_service import run_simulation
 
@@ -83,12 +86,60 @@ def main() -> None:
         assert saved["diffusion"]["status"] == "unavailable"
         assert saved["diffusion"]["estimate"] is None
 
+        parameters = LennardJonesParameters(
+            num_particles=36,
+            box_size=(8.0, 8.0),
+            initial_temperature=0.1,
+            num_steps=4,
+            time_step=0.001,
+            sample_stride=1,
+            seed=42,
+        )
+        result = run_simulation(
+            parameters, task_id="core_lj", attempt_id="wheel", artifacts_dir=root
+        )
+        assert result["status"] == "completed"
+        assert result["model_version"] == "lennard-jones-2d-v1"
+        assert result["potential_energy"] < 0 and result["total_energy"] < 0
+        assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
+        manifest = json.loads((root / result["artifacts"]["manifest"]).read_text())
+        assert manifest["execution"]["backend"] == "numpy"
+        assert manifest["model"]["integrator"] == "velocity-verlet"
+        assert "shifted-force" in manifest["model"]["potential"]["name"]
+        records = {entry["path"]: entry for entry in manifest["artifacts"]}
+        for path, record in records.items():
+            assert hashlib.sha256((root / path).read_bytes()).hexdigest() == record["sha256"]
+        trajectory = load_trajectory_state(
+            root / result["artifacts"]["trajectory"],
+            expected_sha256=records[result["artifacts"]["trajectory"]]["sha256"],
+            expected_particles=parameters.num_particles,
+            expected_sample_steps=parameters.sampling_steps(),
+            expected_time_step=parameters.time_step,
+        )
+        assert trajectory["positions"].shape == (5, 36, 2)
+        with np.load(root / result["artifacts"]["final_state"], allow_pickle=False) as state:
+            assert set(state.files) == {"positions", "unwrapped_positions", "velocities"}
+            np.testing.assert_array_equal(trajectory["positions"][-1], state["unwrapped_positions"])
+            assert ((state["positions"] >= 0) & (state["positions"] < 8)).all()
+        saved = json.loads((root / result["artifacts"]["observables"]).read_text())
+        series = {
+            name: np.asarray(values, dtype=np.float64) for name, values in saved["series"].items()
+        }
+        observed = analyze_lj_observables(
+            trajectory["positions"], trajectory["sample_steps"], series, parameters=parameters
+        )
+        assert observed == saved
+        assert observed["series"]["total_energy"][-1] == result["total_energy"]
+        assert observed["rdf"]["dimensions"] == 2
+        assert observed["energy_drift"]["applicable"] is True
+
     for operation in (
         lambda: require_backend("numba"),
         lambda: create_simulator(
             SimulationParameters(initial_temperature=1.0, num_particles=4, backend="numba")
         ),
         lambda: create_langevin_simulator(LangevinParameters(1.0, 1.0, 4, backend="numba")),
+        lambda: create_lj_simulator(LennardJonesParameters(backend="numba")),
     ):
         try:
             operation()
@@ -110,9 +161,8 @@ def main() -> None:
     )
     assert "scientific_api.models.numba_engine" not in sys.modules
     assert "scientific_api.models.langevin_numba" not in sys.modules
-    print(
-        "Core-only wheel: OU/Langevin transport runs; optional compute/plot libraries stay absent"
-    )
+    assert "scientific_api.models.lj_numba" not in sys.modules
+    print("Core-only wheel: OU/Langevin/LJ run and reanalyze; optional libraries stay absent")
 
 
 if __name__ == "__main__":

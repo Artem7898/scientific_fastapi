@@ -14,6 +14,7 @@ import numpy as np
 
 from ..schemas.ensemble import EnsembleRequest, EnsembleStatus
 from ..schemas.langevin import LangevinEnsembleParameters
+from ..schemas.lennard_jones import LennardJonesEnsembleParameters
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
@@ -144,11 +145,17 @@ def aggregate_ensemble(snapshot: dict[str, Any]) -> dict[str, Any]:
     theoretical_error = None
     if status == "completed":
         statistics = {}
-        metrics = (
-            ("final_temperature", "total_energy")
-            if request.model == "ideal-gas-ou-v1"
-            else ("thermal_temperature", "kinetic_energy", "final_centered_msd")
-        )
+        metrics = {
+            "ideal-gas-ou-v1": ("final_temperature", "total_energy"),
+            "langevin-free-v1": ("thermal_temperature", "kinetic_energy", "final_centered_msd"),
+            "lennard-jones-2d-v1": (
+                "thermal_temperature",
+                "kinetic_energy",
+                "potential_energy",
+                "total_energy",
+                "pressure",
+            ),
+        }[request.model]
         if request.model == "langevin-free-v1" and all(
             child["result"].get("diffusion", {}).get("status") == "available" for child in children
         ):
@@ -176,7 +183,7 @@ def aggregate_ensemble(snapshot: dict[str, Any]) -> dict[str, Any]:
             theoretical_error = thermal_temperature / math.sqrt(
                 (parameters.num_particles - 1) * request.replicas
             )
-        else:
+        elif not isinstance(request.parameters, LennardJonesEnsembleParameters):
             theoretical_error = request.parameters.initial_temperature / math.sqrt(
                 request.parameters.num_particles * request.replicas
             )
@@ -209,11 +216,11 @@ def ensemble_manifest(snapshot: dict[str, Any]) -> dict[str, Any]:
             "contribution": "One committed terminal result per logical replica in replica-index order",
             "sample_standard_deviation": "ddof=1; unavailable for one replica",
             "standard_error": "Sample standard deviation divided by sqrt(n); unavailable for one replica",
-            "theoretical_temperature_standard_error": (
-                "T_target / sqrt(N * M), independent equilibrium 2D snapshots"
-                if result["model"] == "ideal-gas-ou-v1"
-                else "T_velocity(t) / sqrt((N - 1) * M), independent 2D Gaussian velocity fluctuations about sample flow"
-            ),
+            "theoretical_temperature_standard_error": {
+                "ideal-gas-ou-v1": "T_target / sqrt(N * M), independent equilibrium 2D snapshots",
+                "langevin-free-v1": "T_velocity(t) / sqrt((N - 1) * M), independent 2D Gaussian velocity fluctuations about sample flow",
+                "lennard-jones-2d-v1": "Unavailable for interacting particles; empirical replica statistics are reported separately",
+            }[result["model"]],
             "failure_policy": "require_all; no survivor-only aggregate",
             "limitations": "No confidence interval or physical-model validation is implied",
         },

@@ -13,6 +13,7 @@ from ....core.queue_manager import QueueManager
 from ....core.task_store import QueueFull
 from ....models.computation import BackendUnavailable, require_backend
 from ....schemas.langevin import LangevinRequest
+from ....schemas.lennard_jones import LennardJonesRequest
 from ....schemas.simulation import (
     SimulationRequest,
     TaskAcceptedResponse,
@@ -53,8 +54,22 @@ async def submit_langevin(
     return await _admit_simulation(payload, response, manager)
 
 
+@router.post(
+    "/lennard-jones",
+    response_model=TaskAcceptedResponse,
+    status_code=202,
+    summary="Submit periodic 2D Lennard–Jones NVE or NVT dynamics",
+)
+async def submit_lennard_jones(
+    payload: LennardJonesRequest,
+    response: Response,
+    manager: Manager,
+) -> TaskAcceptedResponse:
+    return await _admit_simulation(payload, response, manager)
+
+
 async def _admit_simulation(
-    payload: SimulationRequest | LangevinRequest,
+    payload: SimulationRequest | LangevinRequest | LennardJonesRequest,
     response: Response,
     manager: QueueManager,
 ) -> TaskAcceptedResponse:
@@ -71,6 +86,8 @@ async def _admit_simulation(
         task_payload = payload.model_dump()
         if isinstance(payload, LangevinRequest):
             task_payload = {"model": "langevin-free-v1", **task_payload}
+        elif isinstance(payload, LennardJonesRequest):
+            task_payload = {"model": "lennard-jones-2d-v1", **task_payload}
         await manager.submit(task_id, task_payload)
     except QueueFull:
         raise HTTPException(
@@ -120,7 +137,7 @@ def _valid_task_id(task_id: str) -> bool:
 )
 async def get_artifact(
     task_id: str,
-    artifact_name: Literal["manifest", "final_state", "trajectory", "transport"],
+    artifact_name: Literal["manifest", "final_state", "trajectory", "transport", "observables"],
     request: Request,
     manager: Manager,
 ) -> FileResponse:
@@ -134,6 +151,8 @@ async def get_artifact(
     filenames = {"manifest": "manifest.json", "final_state": "final_state.npz"}
     if result.get("model_version") == "langevin-free-v1":
         filenames.update(trajectory="trajectory.npz", transport="transport.json")
+    elif result.get("model_version") == "lennard-jones-2d-v1":
+        filenames.update(trajectory="trajectory.npz", observables="observables.json")
     if artifact_name not in filenames:
         raise HTTPException(404, "Artifact not found")
     expected = f"{task_id}/{attempt_id}/{filenames[artifact_name]}"
@@ -148,7 +167,7 @@ async def get_artifact(
     return FileResponse(
         path,
         media_type="application/json"
-        if artifact_name in {"manifest", "transport"}
+        if artifact_name in {"manifest", "transport", "observables"}
         else "application/octet-stream",
         filename=path.name,
     )

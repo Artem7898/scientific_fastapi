@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from scientific_api.core import task_store
 from scientific_api.core.config import Settings
 from scientific_api.core.task_store import MemoryTaskStore, RedisTaskStore
-from scientific_api.domain.simulation import SimulationParameters
+from scientific_api.domain.experiments import parameters_from_payload
 from scientific_api.main import create_app
 from scientific_api.models import computation
 from scientific_api.services.simulation_service import run_simulation
@@ -211,8 +211,9 @@ def test_numba_ensemble_uses_persisted_backend_for_every_replica(tmp_path):
 
 @pytest.mark.parametrize("storage", ["memory", "redis"])
 @pytest.mark.parametrize("backend_name", ["numpy", "numba"])
+@pytest.mark.parametrize("model", ["ideal", "lj"])
 def test_retry_preserves_backend_seed_and_fences_obsolete_results(
-    tmp_path, monkeypatch, storage, backend_name
+    tmp_path, monkeypatch, storage, backend_name, model
 ):
     if backend_name == "numba":
         pytest.importorskip("numba")
@@ -231,6 +232,17 @@ def test_retry_preserves_backend_seed_and_fences_obsolete_results(
         store = MemoryTaskStore()
     try:
         payload = {**PAYLOAD, "seed": 2**64 - 1, "backend": backend_name}
+        if model == "lj":
+            payload = {
+                "model": "lennard-jones-2d-v1",
+                "num_particles": 36,
+                "box_size": [8.0, 8.0],
+                "initial_temperature": 0.5,
+                "num_steps": 6,
+                "sample_stride": 3,
+                "seed": 2**64 - 1,
+                "backend": backend_name,
+            }
         store.submit("retry", payload, {})
         obsolete = store.claim()
         assert obsolete is not None
@@ -248,13 +260,13 @@ def test_retry_preserves_backend_seed_and_fences_obsolete_results(
         # A previous thread can finish after losing its lease. Its
         # artifacts remain isolated and cannot replace the committed attempt.
         stale_result = run_simulation(
-            SimulationParameters(**obsolete.payload),
+            parameters_from_payload(obsolete.payload),
             task_id=obsolete.task_id,
             attempt_id=obsolete.owner,
             artifacts_dir=tmp_path,
         )
         retried_result = run_simulation(
-            SimulationParameters(**current.payload),
+            parameters_from_payload(current.payload),
             task_id=current.task_id,
             attempt_id=current.owner,
             artifacts_dir=tmp_path,

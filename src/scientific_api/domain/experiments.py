@@ -3,9 +3,10 @@
 from typing import Any
 
 from .langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
+from .lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from .simulation import MODEL_VERSION, SimulationParameters
 
-ExperimentParameters = SimulationParameters | LangevinParameters
+ExperimentParameters = SimulationParameters | LangevinParameters | LennardJonesParameters
 
 
 def parameters_from_payload(payload: dict[str, Any]) -> ExperimentParameters:
@@ -18,4 +19,6 @@ def parameters_from_payload(payload: dict[str, Any]) -> ExperimentParameters:
         return SimulationParameters(**values)
     if model == LANGEVIN_MODEL_VERSION:
         return LangevinParameters(**values)
+    if model == LJ_MODEL_VERSION:
+        return LennardJonesParameters(**values)
     raise ValueError("Unknown scientific model")

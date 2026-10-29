@@ -1,0 +1,79 @@
+{
+  "created_at": "2026-10-29T23:00:12.286468+00:00",
+  "environment": {
+    "numpy": "2.5.4",
+    "python": "3.12.14"
+  },
+  "estimates": {
+    "potential_energy": {
+      "absolute_resolution_allowance": 0.001,
+      "successive_grid_differences": [
+        0.00010060078060686317,
+        5.60040881425472e-06
+      ],
+      "value": -0.4206600741038351
+    },
+    "virial": {
+      "absolute_resolution_allowance": 0.01,
+      "successive_grid_differences": [
+        0.002346828946654972,
+        0.00010681792118599764
+      ],
+      "value": -0.1479315016155977
+    }
+  },
+  "grids": [
+    {
+      "grid_per_coordinate": 64,
+      "potential_energy": -0.420553872914414,
+      "potential_energy_variance": 0.22340839862142167,
+      "relative_coordinate_points": 16777216,
+      "virial": -0.14547785474775674
+    },
+    {
+      "grid_per_coordinate": 96,
+      "potential_energy": -0.42065447369502085,
+      "potential_energy_variance": 0.22390105578296549,
+      "relative_coordinate_points": 84934656,
+      "virial": -0.1478246836944117
+    },
+    {
+      "grid_per_coordinate": 128,
+      "potential_energy": -0.4206600741038351,
+      "potential_energy_variance": 0.2239312663575425,
+      "relative_coordinate_points": 268435456,
+      "virial": -0.1479315016155977
+    }
+  ],
+  "limitations": [
+    "Three particles at one specified 2D state point with a shifted-force cutoff",
+    "No long-range tail correction or 3D fluid reference is imported",
+    "Production overlap rejection below 0.5 sigma has negligible canonical weight at T=1",
+    "Agreement does not establish equilibration for every density, temperature or timestep"
+  ],
+  "method": "Periodic 4D midpoint quadrature with particle one fixed at the origin",
+  "normalization": "Boltzmann exp(-U/T); translational volume and quadrature volume cancel in ratios",
+  "physics": {
+    "bath_temperature": 1.0,
+    "boltzmann_constant": 1.0,
+    "box_size": [
+      6.0,
+      6.0
+    ],
+    "cutoff_policy": "shifted-force",
+    "cutoff_radius": 2.5,
+    "dimensions": 2,
+    "epsilon": 1.0,
+    "mass": 1.0,
+    "model_version": "lennard-jones-2d-v1",
+    "num_particles": 3,
+    "sigma": 1.0
+  },
+  "resolution_interpretation": "Successive-grid differences and a conservative allowance, not a rigorous bound",
+  "schema_version": 1,
+  "source": {
+    "path": "scripts/validate_lj_reference.py",
+    "production_imports": false,
+    "sha256": "0398413a311cba0bc8accd0ce79e1a5c6938ea14352d3fae4338fdcc847821ff"
+  }
+}
