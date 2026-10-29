@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the periodic `lennard-jones-2d-v1` model with shifted-force interactions, NVE velocity Verlet and NVT BAOAB, while preserving the earlier OU and free-Langevin contracts.
+- Validate direct forces against cell-built Verlet neighbor lists and optional Numba, with unwrapped displacement rebuilds and explicit pair-work/trajectory budgets.
+- Persist signed energies, pressure, sampled trajectories, a finite-N 2D radial distribution, and model-specific provenance; keep correlated-frame summaries separate from independent-replica uncertainty.
+- Extend queued model dispatch, ensembles, artifact downloads and cold/warm engine benchmarks to interacting particles.
 - Add the separate `langevin-free-v1` model with exact joint position/velocity transitions, independent initial/bath temperatures, mass, relaxation rate, and constant external acceleration.
 - Preserve continuous coordinates across periodic boundaries and persist bounded sampled trajectories, terminal positions/velocities, transport diagnostics, and SHA256-linked model provenance.
 - Report raw and unbiased centered MSD, drift, thermal temperature, and diffusion estimates with transient/bias gates and delete-one-particle jackknife uncertainty.

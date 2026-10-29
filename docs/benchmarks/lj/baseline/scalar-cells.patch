@@ -1,0 +1,50 @@
+--- a/src/scientific_api/models/lj_forces.py
++++ b/src/scientific_api/models/lj_forces.py
+@@ -311,33 +311,20 @@
+                         for dy in (-1, 0, 1)
+                     }
+                 )
+-                candidates = np.fromiter(
+-                    (
+-                        second
+-                        for neighbour in neighbours
+-                        for second in cells.get(neighbour, ())
+-                        if second > first
+-                    ),
+-                    dtype=np.int64,
+-                )
+-                # Each row has at most N-1 entries. Batch its geometric tests
+-                # without creating a dense N-by-N distance array. If the work
+-                # budget ends inside this row, evaluate only its allowed prefix.
+-                available = remaining - self.last_candidate_checks
+-                exhausted = len(candidates) > available
+-                candidates = candidates[:available]
+-                if len(candidates):
+-                    self.candidate_checks += len(candidates)
+-                    self.last_candidate_checks += len(candidates)
+-                    displacement = wrapped[first] - wrapped[candidates]
+-                    displacement -= self.box_size * np.rint(displacement / self.box_size)
+-                    distances = np.einsum("ij,ij->i", displacement, displacement)
+-                    selected = candidates[distances < radius_squared]
+-                    if len(pairs) + len(selected) > self.max_pairs:
+-                        raise NeighborCapacityError("Neighbour pair capacity exhausted")
+-                    pairs.extend((first, int(second)) for second in selected)
+-                if exhausted:
+-                    raise PairBudgetExceeded("Neighbour candidate work budget exhausted")
++                for neighbour in neighbours:
++                    for second in cells.get(neighbour, ()):
++                        if second <= first:
++                            continue
++                        if self.last_candidate_checks >= remaining:
++                            raise PairBudgetExceeded("Neighbour candidate work budget exhausted")
++                        self.candidate_checks += 1
++                        self.last_candidate_checks += 1
++                        displacement = wrapped[first] - wrapped[second]
++                        displacement -= self.box_size * np.rint(displacement / self.box_size)
++                        if float(np.dot(displacement, displacement)) < radius_squared:
++                            if len(pairs) >= self.max_pairs:
++                                raise NeighborCapacityError("Neighbour pair capacity exhausted")
++                            pairs.append((first, second))
+         result = np.asarray(sorted(pairs), dtype=np.int64).reshape((-1, 2))
+         result.setflags(write=False)
+         self._pairs = result

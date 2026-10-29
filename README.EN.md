@@ -62,6 +62,22 @@ curl -o transport.json http://localhost:8000/api/v1/simulations/TASK_ID/artifact
 
 Space is unbounded by default. Add `"boundary":"periodic","box_size":[5.0,5.0]` for a periodic domain. Terminal `positions` lie inside the box, while the trajectory stores continuous unwrapped coordinates, so boundary crossings do not create artificial MSD saturation. Frame count and memory are bounded. See the [development guide](docs/development.md#координаты-поля-и-анализ-переноса) for assumptions and saved-trajectory reanalysis.
 
+## Interacting particles: Lennard–Jones
+
+`lennard-jones-2d-v1` adds a two-dimensional periodic Lennard–Jones system. Choose NVE with velocity Verlet, or NVT with BAOAB and an explicit bath temperature:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/lennard-jones \
+  -H 'Content-Type: application/json' \
+  -d '{"num_particles":64,"box_size":[12.0,12.0],"initial_temperature":1.0,"ensemble":"nve","time_step":0.002,"num_steps":1000,"sample_stride":10,"seed":42,"interaction_backend":"verlet"}'
+```
+
+For NVT, set `"ensemble":"nvt","bath_temperature":1.0,"friction":1.0`. The shifted-force cutoff makes both potential and force continuous at the cutoff. `interaction_backend="direct"` is the reference pair calculation; `"verlet"` uses a cell-built neighbor list, rebuilt when any unwrapped displacement reaches half the skin. The separate `backend` field selects NumPy or optional Numba.
+
+After completion, download `manifest`, `final_state`, `trajectory` and `observables` through the task's existing artifact URLs. `observables.json` contains energy/temperature/pressure series, energy diagnostics and a finite-size-normalized 2D radial distribution. Potential energy, total energy and pressure may be negative. Initial velocities have zero center-of-mass motion and a fixed kinetic temperature; this is not a canonical equilibrium draw. NVT needs equilibration, and correlated frames do not provide independent standard errors.
+
+The timestep is bounded relative to `sigma*sqrt(mass/epsilon)` and the work, pair checks and trajectory sizes have explicit limits. Units remain reduced with `k_B=1`; this model does not establish a real substance's properties. See the [LJ workflow and benchmark](docs/development.md#леннард--джонс-взаимодействующие-частицы) for setup, validation and measured costs.
+
 ## Optional Numba execution
 
 NumPy remains the default and reference implementation. To use the CPU Numba backend, install its extra in the API environment and every worker consuming the same queue:
@@ -73,13 +89,13 @@ uv run --no-sync uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
 
 Include `"backend":"numba"` in the simulation request. For an ensemble, put the same field inside `parameters`; every replica uses that backend. Keep any other required extras in the `uv sync` command. Missing Numba produces `503` before admission; unknown backend names, including `jax`, produce `422`. Execution never silently switches to NumPy.
 
-Both implementations use float64 velocities and NumPy PCG64 noise generated one step at a time. Numba compiles the CPU update with `fastmath=False` and no internal parallel pool. The service calculates temperature and energy at the terminal step, while cancellation checks and progress updates retain step boundaries. The first Numba calculation in each process includes import and compilation costs; compilation is not cached on disk. The run manifest records the actual backend, implementation and kernel versions, dtype, device, and RNG policy in `execution`.
+Both implementations use float64 state and local NumPy PCG64 randomness. Stochastic models generate noise one step at a time; NVE only draws initial velocities. Numba compiles CPU kernels with `fastmath=False` and no internal parallel pool. OU workflows calculate terminal observables; LJ also records its requested observable samples. Cancellation checks and progress updates retain step boundaries. The first Numba calculation in each process includes import and compilation costs; compilation is not cached on disk. The run manifest records the actual backend, implementation and kernel versions, dtype, device, and RNG policy in `execution`.
 
 Choose a backend using the [runtime benchmark](docs/development.md#benchmark) on the target machine. JAX remains an optional benchmark experiment; GPU execution is not an API backend. A GPU speedup requires a verified device and measurements that include data transfer and synchronization.
 
 ## Analyze a saved simulation
 
-After `status="completed"` for `ideal-gas-ou-v1`, analyze the saved velocities without running another simulation. `langevin-free-v1` uses its separate `transport.json`, since flow and a nonequilibrium initial temperature require a different reference. JSON analysis works with the minimal installation:
+After `status="completed"` for `ideal-gas-ou-v1`, analyze the saved velocities without running another simulation. `langevin-free-v1` uses `transport.json`; the interacting LJ model uses `observables.json`. Their physical/statistical contracts differ from the equilibrium-only velocity report. JSON analysis works with the minimal installation:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/analyses \
@@ -127,6 +143,8 @@ All seeds are saved before execution, and admission reserves capacity for every 
 
 For transport studies, set `"model":"langevin-free-v1"` and put the new endpoint's parameters without `seed` inside `parameters`. Ensemble statistics follow the selected model; kinetic energy from drift is kept separate from thermal temperature.
 
+For interacting particles, set `"model":"lennard-jones-2d-v1"`. Replicas aggregate thermal temperature, kinetic/potential/total energy and pressure. The independent-OU theoretical temperature error is unavailable for this model; between-replica SD/SE still requires independent seeds and at least two successful replicas.
+
 ## Reproducibility
 
 - Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
@@ -134,7 +152,7 @@ For transport studies, set `"model":"langevin-free-v1"` and put the new endpoint
 - `uv.lock` fixes resolved dependencies; `uv sync --frozen` installs without regenerating the lockfile. A `pylock.toml` export supports tools implementing PEP 751.
 - Tests check repeatability in a fixed environment, analytical properties of the model, the API contract, and research artifact generation.
 
-A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of `ideal-gas-ou-v1`. The new model distinguishes thermal-temperature uncertainty, diffusion estimation and between-replica statistics; these quantities do not include physical model error or measurement uncertainty.
+A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of `ideal-gas-ou-v1`. Free Langevin distinguishes thermal-temperature uncertainty, diffusion estimation and between-replica statistics. LJ uses its interacting-model observables and independent-replica summaries; correlated frames are not independent observations. These estimates do not include physical model error or measurement uncertainty.
 
 ## Optional dependencies
 

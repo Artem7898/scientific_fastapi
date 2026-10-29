@@ -13,7 +13,9 @@ from typing import Any
 
 from ..domain.experiments import parameters_from_payload
 from ..domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
+from ..domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from ..domain.simulation import SimulationCancelled
+from ..models.lj_forces import NeighborCapacityError, PairBudgetExceeded, ParticleOverlapError
 from ..services.simulation_service import run_simulation
 from .config import Settings
 from .experiment_tracker import ExperimentTracker
@@ -170,17 +172,31 @@ class QueueManager:
                     self._executor, context.run, function
                 )
                 result = await asyncio.shield(computation)
-                metrics = (
-                    ("thermal_temperature", "kinetic_energy", "thermal_temperature_standard_error")
-                    if isinstance(parameters, LangevinParameters)
-                    else ("final_temperature", "total_energy", "temperature_standard_error")
-                )
+                if isinstance(parameters, LennardJonesParameters):
+                    metrics = (
+                        "thermal_temperature",
+                        "kinetic_energy",
+                        "potential_energy",
+                        "total_energy",
+                        "pressure",
+                    )
+                elif isinstance(parameters, LangevinParameters):
+                    metrics = (
+                        "thermal_temperature",
+                        "kinetic_energy",
+                        "thermal_temperature_standard_error",
+                    )
+                else:
+                    metrics = ("final_temperature", "total_energy", "temperature_standard_error")
                 for name in metrics:
                     if not math.isfinite(result[name]):
                         raise FloatingPointError("Simulation produced a nonfinite result")
                 if (
                     isinstance(parameters, LangevinParameters)
                     and result.get("model_version") != LANGEVIN_MODEL_VERSION
+                ) or (
+                    isinstance(parameters, LennardJonesParameters)
+                    and result.get("model_version") != LJ_MODEL_VERSION
                 ):
                     raise ValueError("Scientific result has the wrong model version")
                 if result.get("task_id") != job.task_id or result.get("status") != "completed":
@@ -206,11 +222,16 @@ class QueueManager:
             raise
         except Exception as exc:
             logger.exception("Simulation %s failed", job.task_id)
-            message = (
-                "Simulation produced nonfinite metrics"
-                if isinstance(exc, FloatingPointError)
-                else "Simulation execution failed; inspect server logs"
-            )
+            if isinstance(exc, ParticleOverlapError):
+                message = "Particles approached within 0.5 sigma; reduce timestep or density"
+            elif isinstance(exc, PairBudgetExceeded):
+                message = "LJ pair-work budget exhausted; reduce particles or steps"
+            elif isinstance(exc, NeighborCapacityError):
+                message = "LJ neighbor capacity exhausted; reduce particles or density"
+            elif isinstance(exc, FloatingPointError):
+                message = "Simulation produced nonfinite metrics"
+            else:
+                message = "Simulation execution failed; inspect server logs"
             try:
                 await self._finish(
                     job,

@@ -23,6 +23,7 @@ from numpy.typing import NDArray
 
 from ..core.experiment_tracker import ExperimentTracker
 from ..domain.langevin import LangevinParameters
+from ..domain.lennard_jones import LennardJonesParameters
 from ..domain.simulation import MODEL_VERSION, SimulationCancelled, SimulationParameters
 from ..models.computation import create_simulator
 
@@ -133,7 +134,7 @@ def _mark_tracking_failed(tracker: ExperimentTracker) -> None:
 
 
 def run_simulation(
-    parameters: SimulationParameters | LangevinParameters,
+    parameters: SimulationParameters | LangevinParameters | LennardJonesParameters,
     *,
     task_id: str,
     artifacts_dir: Path,
@@ -151,6 +152,18 @@ def run_simulation(
     step boundaries. An exception, including tracking or persistence failure,
     is propagated to the caller instead of returning a successful experiment.
     """
+    if isinstance(parameters, LennardJonesParameters):
+        from .lennard_jones_service import run_lj_simulation
+
+        return run_lj_simulation(
+            parameters,
+            task_id=task_id,
+            artifacts_dir=artifacts_dir,
+            attempt_id=attempt_id,
+            tracker=tracker,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
     if isinstance(parameters, LangevinParameters):
         from .langevin_service import run_langevin_simulation
 

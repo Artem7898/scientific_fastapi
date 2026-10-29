@@ -1,0 +1,552 @@
+{
+  "benchmark": "lj-engine",
+  "hardware": {
+    "cgroup_cpu_quota_cores": 4.0,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "cpu_count": 5,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+    "thread_limits": {
+      "MKL_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1"
+    }
+  },
+  "methodology": {
+    "cold_call": "First engine initialization, integration and terminal observables; optional import/JIT included; Python/common NumPy/package imports excluded",
+    "excluded": "HTTP, queue waiting, tracking, RDF, trajectory sampling, artifact I/O, reference generation, numerical validation and process startup",
+    "interpretation": "Local measurements at fixed density and timestep; long chaotic MD paths need not remain close across implementations; no universal speed or GPU claim",
+    "isolation": "One fresh subprocess per variant; variants measured serially",
+    "memory": "Peak RSS covers imports, JIT, reference and validation state, not incremental neighbor-list allocation",
+    "reference": "NumPy direct force engine; identical initial parameters and PCG64 seed; only short-horizon numerical agreement is tested",
+    "warm_call": "New same-seed engine per sample; lattice/velocities, initial force, neighbor construction/rebuilding, integration and terminal observables included"
+  },
+  "model_version": "lennard-jones-2d-v1",
+  "schema_version": 1,
+  "variants": {
+    "numba-direct": {
+      "cold_call": {
+        "evolution_seconds": 0.0010207840241491795,
+        "initialization_seconds": 0.9205669249931816,
+        "terminal_observables_seconds": 8.010899182409048e-05,
+        "wall_seconds": 0.9216678180091549
+      },
+      "diagnostics": {
+        "analysis_pair_evaluations": 0,
+        "interaction_backend": "direct",
+        "neighbor_candidate_checks": 0,
+        "neighbor_rebuilds": 0,
+        "pair_budget": 100000000,
+        "pair_evaluations": 42336,
+        "total_pair_checks": 42336
+      },
+      "environment": {
+        "free_threaded_build": false,
+        "gil_enabled_after_backend": true,
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "fbe25edc2a1fc3e30b1351bd6d034265ae7acf9b",
+        "source_dirty": true,
+        "source_sha256": "31d9a23607129c75ab49d56c40ef2b29e6904fca8b3b35ed1726a9a49049aad6",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numba",
+        "backend_version": "0.68.0",
+        "cache": false,
+        "cutoff_policy": "shifted-force; potential and radial force vanish at cutoff",
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "initialization": "rectangular lattice; Gaussian velocity directions, zero COM, fixed initial thermal temperature",
+        "integrator": "velocity-verlet",
+        "interaction_backend": "direct",
+        "kernel_version": "lj-shifted-force-numba-v1",
+        "llvm_version": "22.1.0",
+        "llvmlite_version": "0.50.0",
+        "nogil": true,
+        "nvt_innovation_order": "particle,dimension; independent lab-frame OU thermostat",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-lj-v1"
+      },
+      "final_observables": {
+        "kinetic_energy": 63.70072952086895,
+        "potential_energy": -36.20140387658789,
+        "pressure": -0.38805004514700303,
+        "thermal_temperature": 1.0111226908074438,
+        "total_energy": 27.499325644281058,
+        "virial": -239.15987204407477
+      },
+      "peak_process_rss_bytes": 175656960,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-10,
+        "max_absolute_errors": {
+          "forces": 6.106226635438361e-16,
+          "observables": 8.526512829121202e-14,
+          "positions": 0.0,
+          "velocities": 4.440892098500626e-16
+        },
+        "reference": "numpy-direct",
+        "rtol": 1e-10,
+        "same_variant_repeatability": "exact final arrays and observables",
+        "state_sha256": {
+          "forces": "2f4f20fe280f7d72ed95e34aad2af7970831fb266a23b6094b124c101f9f4712",
+          "positions": "4600a55735283d402afc525d937290985f54d77dacc1a67a8c3dbc3df75cef0a",
+          "velocities": "4b37d46cb4066fde1dd061d8f11b1d8e40dc6229d4e7786cd47fe6889038a81b"
+        }
+      },
+      "warm_call": {
+        "evolution_seconds": {
+          "median_seconds": 0.0007388659869320691,
+          "p95_seconds": 0.000813027995172888,
+          "samples_seconds": [
+            0.0006754419882781804,
+            0.0006973050185479224,
+            0.0007481399807147682,
+            0.0007388659869320691,
+            0.000829249998787418
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.0001316760026384145,
+          "p95_seconds": 0.00023315181606449185,
+          "samples_seconds": [
+            0.0002514030202291906,
+            0.000160146999405697,
+            0.0001316760026384145,
+            0.0001226919994223863,
+            0.00012677800259552896
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 2.4376000510528684e-05,
+          "p95_seconds": 2.5399815058335662e-05,
+          "samples_seconds": [
+            2.085100277327001e-05,
+            2.5087007088586688e-05,
+            2.4376000510528684e-05,
+            2.4165987269952893e-05,
+            2.5478017050772905e-05
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 0.0009041919838637114,
+          "p95_seconds": 0.000974744017003104,
+          "samples_seconds": [
+            0.000947696011280641,
+            0.000882539025042206,
+            0.0009041919838637114,
+            0.0008857239736244082,
+            0.0009815060184337199
+          ]
+        }
+      },
+      "warm_speed_ratio_over_numpy_direct": 53.85657455629301
+    },
+    "numba-verlet": {
+      "cold_call": {
+        "evolution_seconds": 0.0012831029889639467,
+        "initialization_seconds": 0.9411453389911912,
+        "terminal_observables_seconds": 5.643401527777314e-05,
+        "wall_seconds": 0.942484875995433
+      },
+      "diagnostics": {
+        "analysis_pair_evaluations": 0,
+        "interaction_backend": "verlet",
+        "neighbor_candidate_checks": 1120,
+        "neighbor_rebuilds": 1,
+        "pair_budget": 100000000,
+        "pair_evaluations": 5376,
+        "total_pair_checks": 6496
+      },
+      "environment": {
+        "free_threaded_build": false,
+        "gil_enabled_after_backend": true,
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "fbe25edc2a1fc3e30b1351bd6d034265ae7acf9b",
+        "source_dirty": true,
+        "source_sha256": "31d9a23607129c75ab49d56c40ef2b29e6904fca8b3b35ed1726a9a49049aad6",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numba",
+        "backend_version": "0.68.0",
+        "cache": false,
+        "cutoff_policy": "shifted-force; potential and radial force vanish at cutoff",
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "initialization": "rectangular lattice; Gaussian velocity directions, zero COM, fixed initial thermal temperature",
+        "integrator": "velocity-verlet",
+        "interaction_backend": "verlet",
+        "kernel_version": "lj-shifted-force-numba-v1",
+        "llvm_version": "22.1.0",
+        "llvmlite_version": "0.50.0",
+        "nogil": true,
+        "nvt_innovation_order": "particle,dimension; independent lab-frame OU thermostat",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-lj-v1"
+      },
+      "final_observables": {
+        "kinetic_energy": 63.70072952086895,
+        "potential_energy": -36.20140387658789,
+        "pressure": -0.38805004514700303,
+        "thermal_temperature": 1.0111226908074438,
+        "total_energy": 27.499325644281058,
+        "virial": -239.15987204407477
+      },
+      "peak_process_rss_bytes": 175869952,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-10,
+        "max_absolute_errors": {
+          "forces": 6.106226635438361e-16,
+          "observables": 8.526512829121202e-14,
+          "positions": 0.0,
+          "velocities": 4.440892098500626e-16
+        },
+        "reference": "numpy-direct",
+        "rtol": 1e-10,
+        "same_variant_repeatability": "exact final arrays and observables",
+        "state_sha256": {
+          "forces": "2f4f20fe280f7d72ed95e34aad2af7970831fb266a23b6094b124c101f9f4712",
+          "positions": "4600a55735283d402afc525d937290985f54d77dacc1a67a8c3dbc3df75cef0a",
+          "velocities": "4b37d46cb4066fde1dd061d8f11b1d8e40dc6229d4e7786cd47fe6889038a81b"
+        }
+      },
+      "warm_call": {
+        "evolution_seconds": {
+          "median_seconds": 0.001319066999712959,
+          "p95_seconds": 0.001581409794744104,
+          "samples_seconds": [
+            0.0016120109939947724,
+            0.0010142349929083139,
+            0.001459004997741431,
+            0.001319066999712959,
+            0.001170206000097096
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.00385450801695697,
+          "p95_seconds": 0.003884132398525253,
+          "samples_seconds": [
+            0.00385450801695697,
+            0.0038741180032957345,
+            0.003706639021402225,
+            0.0038866359973326325,
+            0.003664046002086252
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 2.6488996809348464e-05,
+          "p95_seconds": 4.57354006357491e-05,
+          "samples_seconds": [
+            2.6488996809348464e-05,
+            5.0183996791020036e-05,
+            2.4555978598073125e-05,
+            2.7941016014665365e-05,
+            2.3936008801683784e-05
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 0.005190199997741729,
+          "p95_seconds": 0.005441135208820924,
+          "samples_seconds": [
+            0.005493008007761091,
+            0.004938536992995068,
+            0.005190199997741729,
+            0.005233644013060257,
+            0.004858188010985032
+          ]
+        }
+      },
+      "warm_speed_ratio_over_numpy_direct": 9.382429003380704
+    },
+    "numpy-direct": {
+      "cold_call": {
+        "evolution_seconds": 0.0499368539894931,
+        "initialization_seconds": 0.007469191012205556,
+        "terminal_observables_seconds": 7.657302194274962e-05,
+        "wall_seconds": 0.05748261802364141
+      },
+      "diagnostics": {
+        "analysis_pair_evaluations": 0,
+        "interaction_backend": "direct",
+        "neighbor_candidate_checks": 0,
+        "neighbor_rebuilds": 0,
+        "pair_budget": 100000000,
+        "pair_evaluations": 42336,
+        "total_pair_checks": 42336
+      },
+      "environment": {
+        "free_threaded_build": false,
+        "gil_enabled_after_backend": true,
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "fbe25edc2a1fc3e30b1351bd6d034265ae7acf9b",
+        "source_dirty": true,
+        "source_sha256": "31d9a23607129c75ab49d56c40ef2b29e6904fca8b3b35ed1726a9a49049aad6",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numpy",
+        "backend_version": "2.5.4",
+        "cutoff_policy": "shifted-force; potential and radial force vanish at cutoff",
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "initialization": "rectangular lattice; Gaussian velocity directions, zero COM, fixed initial thermal temperature",
+        "integrator": "velocity-verlet",
+        "interaction_backend": "direct",
+        "kernel_version": "lj-shifted-force-numpy-v1",
+        "nvt_innovation_order": "particle,dimension; independent lab-frame OU thermostat",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-lj-v1"
+      },
+      "final_observables": {
+        "kinetic_energy": 63.700729520868954,
+        "potential_energy": -36.20140387658783,
+        "pressure": -0.3880500451470027,
+        "thermal_temperature": 1.0111226908074438,
+        "total_energy": 27.49932564428112,
+        "virial": -239.1598720440747
+      },
+      "peak_process_rss_bytes": 31584256,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-10,
+        "max_absolute_errors": {
+          "forces": 0.0,
+          "observables": 0.0,
+          "positions": 0.0,
+          "velocities": 0.0
+        },
+        "reference": "numpy-direct",
+        "rtol": 1e-10,
+        "same_variant_repeatability": "exact final arrays and observables",
+        "state_sha256": {
+          "forces": "0df54d0d0590a5a44c8e464b73b23a1959f862fa40158d3838a1d95a55c31e96",
+          "positions": "4600a55735283d402afc525d937290985f54d77dacc1a67a8c3dbc3df75cef0a",
+          "velocities": "c10afd078f9bbdf36ee11ab96008a60b8697dca7823bdb645abb16864952afd6"
+        }
+      },
+      "warm_call": {
+        "evolution_seconds": {
+          "median_seconds": 0.04631749400869012,
+          "p95_seconds": 0.0467735547805205,
+          "samples_seconds": [
+            0.04399672200088389,
+            0.046190736000426114,
+            0.046713682007975876,
+            0.046788522973656654,
+            0.04631749400869012
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.0023508469748776406,
+          "p95_seconds": 0.0024800666025839744,
+          "samples_seconds": [
+            0.0025088010006584227,
+            0.0023482539982069284,
+            0.0023508469748776406,
+            0.002365129010286182,
+            0.002341412997338921
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 3.7775986129418015e-05,
+          "p95_seconds": 4.0607608389109374e-05,
+          "samples_seconds": [
+            3.494200063869357e-05,
+            3.748500603251159e-05,
+            4.099000943824649e-05,
+            3.907800419256091e-05,
+            3.7775986129418015e-05
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 0.04869668299215846,
+          "p95_seconds": 0.04917528778896667,
+          "samples_seconds": [
+            0.04654046500218101,
+            0.048576475004665554,
+            0.04910551899229176,
+            0.0491927299881354,
+            0.04869668299215846
+          ]
+        }
+      },
+      "warm_speed_ratio_over_numpy_direct": 1.0
+    },
+    "numpy-verlet": {
+      "cold_call": {
+        "evolution_seconds": 0.002671121997991577,
+        "initialization_seconds": 0.007962542993482202,
+        "terminal_observables_seconds": 3.898801514878869e-05,
+        "wall_seconds": 0.010672653006622568
+      },
+      "diagnostics": {
+        "analysis_pair_evaluations": 0,
+        "interaction_backend": "verlet",
+        "neighbor_candidate_checks": 1120,
+        "neighbor_rebuilds": 1,
+        "pair_budget": 100000000,
+        "pair_evaluations": 5376,
+        "total_pair_checks": 6496
+      },
+      "environment": {
+        "free_threaded_build": false,
+        "gil_enabled_after_backend": true,
+        "lockfile_sha256": "e79b7e7ddf6983d83a4829d68f6b0113b6c006c7785540f14f56e98f4fbce238",
+        "machine": "x86_64",
+        "numpy": "2.5.4",
+        "package_version": "2.0.0",
+        "processor": "",
+        "python": "3.12.14",
+        "python_implementation": "CPython",
+        "source_commit": "fbe25edc2a1fc3e30b1351bd6d034265ae7acf9b",
+        "source_dirty": true,
+        "source_sha256": "31d9a23607129c75ab49d56c40ef2b29e6904fca8b3b35ed1726a9a49049aad6",
+        "system": "Linux"
+      },
+      "execution": {
+        "backend": "numpy",
+        "backend_version": "2.5.4",
+        "cutoff_policy": "shifted-force; potential and radial force vanish at cutoff",
+        "device": "cpu",
+        "dtype": "float64",
+        "fastmath": false,
+        "initialization": "rectangular lattice; Gaussian velocity directions, zero COM, fixed initial thermal temperature",
+        "integrator": "velocity-verlet",
+        "interaction_backend": "verlet",
+        "kernel_version": "lj-shifted-force-numpy-v1",
+        "nvt_innovation_order": "particle,dimension; independent lab-frame OU thermostat",
+        "parallel": false,
+        "rng_policy": "numpy-pcg64-lj-v1"
+      },
+      "final_observables": {
+        "kinetic_energy": 63.70072952086895,
+        "potential_energy": -36.20140387658785,
+        "pressure": -0.38805004514700275,
+        "thermal_temperature": 1.0111226908074438,
+        "total_energy": 27.4993256442811,
+        "virial": -239.1598720440747
+      },
+      "peak_process_rss_bytes": 31731712,
+      "status": "passed",
+      "validation": {
+        "atol": 1e-10,
+        "max_absolute_errors": {
+          "forces": 4.440892098500626e-16,
+          "observables": 2.1316282072803006e-14,
+          "positions": 0.0,
+          "velocities": 4.440892098500626e-16
+        },
+        "reference": "numpy-direct",
+        "rtol": 1e-10,
+        "same_variant_repeatability": "exact final arrays and observables",
+        "state_sha256": {
+          "forces": "9f9e7ed7ed7978084ee0106222715e62fd75d0182ec616f437f9590048bd620a",
+          "positions": "4600a55735283d402afc525d937290985f54d77dacc1a67a8c3dbc3df75cef0a",
+          "velocities": "13d82dd6061e9535c1619a42d547932aa6a701b0560ec2f17d0aaa223a9fc27e"
+        }
+      },
+      "warm_call": {
+        "evolution_seconds": {
+          "median_seconds": 0.0025033039855770767,
+          "p95_seconds": 0.0026641944190487266,
+          "samples_seconds": [
+            0.002662879996933043,
+            0.002497225010301918,
+            0.0024917970004025847,
+            0.0025033039855770767,
+            0.0026645230245776474
+          ]
+        },
+        "initialization_seconds": {
+          "median_seconds": 0.0035291249805595726,
+          "p95_seconds": 0.0036437259870581327,
+          "samples_seconds": [
+            0.0036087940097786486,
+            0.003518520010402426,
+            0.0035291249805595726,
+            0.0034794520179275423,
+            0.003652458981378004
+          ]
+        },
+        "terminal_observables_seconds": {
+          "median_seconds": 2.2763997549191117e-05,
+          "p95_seconds": 2.4536001728847622e-05,
+          "samples_seconds": [
+            2.258399035781622e-05,
+            2.1451996872201562e-05,
+            2.455600770190358e-05,
+            2.2763997549191117e-05,
+            2.4455977836623788e-05
+          ]
+        },
+        "wall_seconds": {
+          "median_seconds": 0.006045477988664061,
+          "p95_seconds": 0.0063320019864477215,
+          "samples_seconds": [
+            0.006294257997069508,
+            0.0060371970175765455,
+            0.006045477988664061,
+            0.00600552000105381,
+            0.006341437983792275
+          ]
+        }
+      },
+      "warm_speed_ratio_over_numpy_direct": 8.055059183652661
+    }
+  },
+  "workload": {
+    "bath_temperature": null,
+    "box_size": [
+      12.0,
+      12.0
+    ],
+    "cutoff_radius": 2.5,
+    "density": 0.4444444444444444,
+    "ensemble": "nve",
+    "epsilon": 1.0,
+    "equilibration_steps": 0,
+    "friction": null,
+    "initial_temperature": 1.0,
+    "mass": 1.0,
+    "neighbor_skin": 0.3,
+    "num_particles": 64,
+    "num_steps": 20,
+    "rdf_bins": 64,
+    "repeats": 5,
+    "sample_stride": 20,
+    "seed": 42,
+    "sigma": 1.0,
+    "time_step": 0.002
+  }
+}

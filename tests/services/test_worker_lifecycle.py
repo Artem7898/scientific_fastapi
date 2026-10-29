@@ -218,7 +218,9 @@ def test_cli_configuration_error_does_not_echo_credentials(tmp_path: Path) -> No
     reason="SCIENTIFIC_TEST_REDIS_URI is not configured",
 )
 @pytest.mark.parametrize("backend_name", ["numpy", "numba"])
-@pytest.mark.parametrize("model_version", ["ideal-gas-ou-v1", "langevin-free-v1"])
+@pytest.mark.parametrize(
+    "model_version", ["ideal-gas-ou-v1", "langevin-free-v1", "lennard-jones-2d-v1"]
+)
 def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
     tmp_path: Path, backend_name: str, model_version: str
 ) -> None:
@@ -235,6 +237,18 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
             box_size=[1.0, 1.0],
         )
         endpoint = "/api/v1/simulations/langevin"
+    elif model_version == "lennard-jones-2d-v1":
+        payload = {
+            "num_particles": 36,
+            "box_size": [8.0, 8.0],
+            "initial_temperature": 0.5,
+            "time_step": 0.002,
+            "num_steps": 12,
+            "sample_stride": 3,
+            "seed": 42,
+            "backend": backend_name,
+        }
+        endpoint = "/api/v1/simulations/lennard-jones"
     redis = pytest.importorskip("redis")
     uri = os.environ["SCIENTIFIC_TEST_REDIS_URI"]
     namespace = "scientific-api-external-worker-" + uuid4().hex
@@ -297,6 +311,13 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
                 )
                 assert transport.status_code == 200
                 assert transport.json()["centered_msd"][-1] == result["final_centered_msd"]
+            elif model_version == "lennard-jones-2d-v1":
+                observables = client.get(
+                    f"/api/v1/simulations/{result['task_id']}/artifacts/observables"
+                )
+                assert observables.status_code == 200
+                assert result["total_energy"] < 0
+                assert observables.json()["series"]["total_energy"][-1] == result["total_energy"]
 
             # A fresh API instance reads durable events and results produced by
             # the separate worker process, rather than relying on local state.

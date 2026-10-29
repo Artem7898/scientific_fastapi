@@ -57,11 +57,15 @@ jobs:
         run: uv run --frozen --no-sync python scripts/benchmark.py --particles 64 --steps 4 --repeats 2 --workers 2 --backends numpy,threads,processes --output /tmp/benchmark-smoke.json
       - name: Verify the real NumPy and Numba runtime backends
         run: uv run --frozen --no-sync python scripts/benchmark_runtime.py --particles 64 --steps 4 --repeats 2 --backends numpy,numba --require-backends --output /tmp/runtime-smoke.json
+      - name: Verify LJ reference and optimized interaction paths
+        run: uv run --frozen --no-sync python scripts/benchmark_lj.py --particles 36 --steps 4 --repeats 2 --variants numpy-direct,numpy-verlet,numba-direct,numba-verlet --require-backends --output /tmp/lj-benchmark-smoke.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: runtime-benchmark-${{ matrix.python }}
-          path: /tmp/runtime-smoke.json
+          path: |
+            /tmp/runtime-smoke.json
+            /tmp/lj-benchmark-smoke.json
           if-no-files-found: ignore
       - name: Export a portable PEP 751 lock
         run: uv export --frozen --format pylock.toml --no-editable --no-emit-project --output-file /tmp/pylock.toml
@@ -214,6 +218,72 @@ jobs:
               json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "hashes": hashes}, stream)
           print("Langevin HTTP response, sampled trajectory and transport checksums passed")
           PYTHON
+      - name: Verify Lennard-Jones HTTP results and signed observables
+        run: |
+          python - <<'PYTHON'
+          import hashlib
+          import io
+          import json
+          import math
+          import time
+          import urllib.request
+          import zipfile
+
+          base = "http://127.0.0.1:8000"
+          payload = {
+              "num_particles": 36, "box_size": [8.0, 8.0], "initial_temperature": 0.1,
+              "num_steps": 6, "time_step": 0.001, "sample_stride": 1, "seed": 42,
+          }
+          request = urllib.request.Request(
+              base + "/api/v1/simulations/lennard-jones", data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              accepted = json.load(response)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              with urllib.request.urlopen(base + accepted["check_url"], timeout=5) as response:
+                  result = json.load(response)
+              if result["status"] == "completed":
+                  break
+              assert result["status"] in {"pending", "running"}, result
+              time.sleep(0.1)
+          else:
+              raise AssertionError("Container Lennard-Jones task did not finish")
+          assert result["task_id"] == accepted["task_id"]
+          assert result["model_version"] == "lennard-jones-2d-v1"
+          assert result["ensemble"] == "nve"
+          assert result["potential_energy"] < 0 and result["total_energy"] < 0
+          assert result["kinetic_energy"] >= 0 and math.isfinite(result["pressure"])
+          assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
+          artifact = base + "/api/v1/simulations/" + result["task_id"] + "/artifacts/"
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              manifest = json.load(response)
+          assert manifest["outputs"] == result
+          assert manifest["model"]["integrator"] == "velocity-verlet"
+          assert "shifted-force" in manifest["model"]["potential"]["name"]
+          assert manifest["execution"]["backend"] == "numpy"
+          records = {entry["path"]: entry for entry in manifest["artifacts"]}
+          hashes = {}
+          artifacts = {}
+          for name in ("final_state", "trajectory", "observables"):
+              with urllib.request.urlopen(artifact + name, timeout=5) as response:
+                  artifacts[name] = response.read()
+              hashes[name] = hashlib.sha256(artifacts[name]).hexdigest()
+              assert hashes[name] == records[result["artifacts"][name]]["sha256"]
+          observed = json.loads(artifacts["observables"])
+          assert observed["series"]["total_energy"][-1] == result["total_energy"]
+          assert observed["series"]["pressure"][-1] == result["pressure"]
+          assert observed["rdf"]["dimensions"] == 2
+          assert observed["energy_drift"]["applicable"] is True
+          assert observed["sample_steps"] == list(range(7))
+          with zipfile.ZipFile(io.BytesIO(artifacts["trajectory"])) as archive:
+              assert set(archive.namelist()) == {"positions.npy", "sample_steps.npy", "times.npy"}
+          with open("/tmp/container-lj-task.json", "w") as stream:
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "hashes": hashes}, stream)
+          print("LJ HTTP response, signed energy, RDF and artifact checksums passed")
+          PYTHON
       - name: Verify task state and artifacts survive API and Redis restart
         run: |
           docker compose restart redis api
@@ -241,7 +311,17 @@ jobs:
           for name, digest in expected["hashes"].items():
               with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
                   assert hashlib.sha256(response.read()).hexdigest() == digest
-          print("OU/Langevin Redis state and artifact volumes survived restart")
+          with open("/tmp/container-lj-task.json") as stream:
+              expected = json.load(stream)
+          with urllib.request.urlopen(base + "status/" + expected["task_id"], timeout=5) as response:
+              result = json.load(response)
+          assert result["status"] == "completed" and result["model_version"] == "lennard-jones-2d-v1"
+          assert result["attempt_id"] == expected["attempt_id"]
+          assert result["potential_energy"] < 0 and result["total_energy"] < 0
+          for name, digest in expected["hashes"].items():
+              with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
+                  assert hashlib.sha256(response.read()).hexdigest() == digest
+          print("OU/Langevin/LJ Redis state and artifact volumes survived restart")
           PYTHON
       - name: Verify separate worker, ensembles and SSE in the container stack
         run: |
@@ -335,7 +415,9 @@ jobs:
           import numpy as np
           import scientific_api
           from scientific_api.domain.langevin import LangevinParameters
+          from scientific_api.domain.lennard_jones import LennardJonesParameters
           from scientific_api.domain.simulation import SimulationParameters
+          from scientific_api.research.lj_analysis import analyze_lj_observables
           from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
           from scientific_api.services.simulation_service import run_simulation
 
@@ -422,7 +504,76 @@ jobs:
               for name in ("positions", "unwrapped_positions", "velocities"):
                   np.testing.assert_allclose(langevin_states["numba"][name], langevin_states["numpy"][name], rtol=1e-11, atol=1e-11)
               np.testing.assert_allclose(langevin_trajectories["numba"], langevin_trajectories["numpy"], rtol=1e-11, atol=1e-11)
-          for manifest in (manifests["numba"], langevin_manifests["numba"]):
+              lj_states = {}
+              lj_trajectories = {}
+              lj_manifests = {}
+              for backend, interaction, ensemble in (
+                  ("numpy", "direct", "nve"), ("numpy", "verlet", "nve"),
+                  ("numba", "direct", "nve"), ("numba", "verlet", "nve"),
+                  ("numba", "verlet", "nvt"),
+              ):
+                  variant = backend + "-" + interaction + "-" + ensemble
+                  parameters = LennardJonesParameters(
+                      num_particles=36, box_size=(8.0, 8.0), initial_temperature=0.1,
+                      num_steps=6, time_step=0.001, sample_stride=1, seed=42,
+                      backend=backend, interaction_backend=interaction, ensemble=ensemble,
+                      **({"bath_temperature": 0.7} if ensemble == "nvt" else {}),
+                  )
+                  result = run_simulation(
+                      parameters, task_id="lj_" + variant, attempt_id="runtime", artifacts_dir=root,
+                  )
+                  assert result["status"] == "completed" and result["model_version"] == "lennard-jones-2d-v1"
+                  assert result["potential_energy"] < 0 and result["total_energy"] < 0
+                  assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
+                  with (root / result["artifacts"]["manifest"]).open() as stream:
+                      manifest = json.load(stream)
+                  assert manifest["parameters"]["backend"] == manifest["execution"]["backend"] == backend
+                  assert manifest["parameters"]["interaction_backend"] == interaction
+                  assert manifest["model"]["version"] == "lennard-jones-2d-v1"
+                  assert "shifted-force" in manifest["model"]["potential"]["name"]
+                  assert "shifted-force" in manifest["execution"]["cutoff_policy"]
+                  assert manifest["model"]["potential"]["tail_correction"] is None
+                  assert manifest["model"]["initialization"]["canonical_sample"] is False
+                  assert manifest["model"]["integrator"] == ("velocity-verlet" if ensemble == "nve" else "baoab")
+                  records = {entry["path"]: entry for entry in manifest["artifacts"]}
+                  for path, record in records.items():
+                      assert hashlib.sha256((root / path).read_bytes()).hexdigest() == record["sha256"]
+                  trajectory = load_trajectory_state(
+                      root / result["artifacts"]["trajectory"],
+                      expected_sha256=records[result["artifacts"]["trajectory"]]["sha256"],
+                      expected_particles=parameters.num_particles,
+                      expected_sample_steps=parameters.sampling_steps(),
+                      expected_time_step=parameters.time_step,
+                  )
+                  assert trajectory["positions"].shape == (7, 36, 2)
+                  with np.load(root / result["artifacts"]["final_state"], allow_pickle=False) as state:
+                      arrays = {name: state[name].copy() for name in state.files}
+                  assert set(arrays) == {"positions", "unwrapped_positions", "velocities"}
+                  assert ((arrays["positions"] >= 0) & (arrays["positions"] < 8)).all()
+                  np.testing.assert_array_equal(trajectory["positions"][-1], arrays["unwrapped_positions"])
+                  with (root / result["artifacts"]["observables"]).open() as stream:
+                      saved = json.load(stream)
+                  series = {name: np.asarray(values, dtype=np.float64) for name, values in saved["series"].items()}
+                  observed = analyze_lj_observables(
+                      trajectory["positions"], trajectory["sample_steps"], series, parameters=parameters,
+                  )
+                  assert observed == saved
+                  assert saved["series"]["total_energy"][-1] == result["total_energy"]
+                  assert saved["series"]["pressure"][-1] == result["pressure"]
+                  assert saved["rdf"]["dimensions"] == 2
+                  assert saved["rdf"]["pair_checks"] == 36 * 35 // 2
+                  assert saved["energy_drift"]["applicable"] is (ensemble == "nve")
+                  if ensemble == "nvt":
+                      assert manifest["parameters"]["friction"] == 1.0
+                      assert manifest["model"]["thermostat"]["bath_temperature"] == 0.7
+                  lj_states[variant] = arrays
+                  lj_trajectories[variant] = trajectory["positions"]
+                  lj_manifests[variant] = manifest
+              for variant in ("numpy-verlet-nve", "numba-direct-nve", "numba-verlet-nve"):
+                  for name in ("positions", "unwrapped_positions", "velocities"):
+                      np.testing.assert_allclose(lj_states[variant][name], lj_states["numpy-direct-nve"][name], rtol=1e-10, atol=1e-10)
+                  np.testing.assert_allclose(lj_trajectories[variant], lj_trajectories["numpy-direct-nve"], rtol=1e-10, atol=1e-10)
+          for manifest in (manifests["numba"], langevin_manifests["numba"], lj_manifests["numba-direct-nve"], lj_manifests["numba-verlet-nve"]):
               execution = manifest["execution"]
               assert execution["backend_version"] == importlib.metadata.version("numba")
               assert execution["llvmlite_version"] == importlib.metadata.version("llvmlite")
@@ -431,7 +582,7 @@ jobs:
               assert execution["fastmath"] is False and execution["parallel"] is False
               assert execution["cache"] is False and execution["nogil"] is True
           assert not any(name.split(".", 1)[0] in {"jax", "jaxlib"} for name in sys.modules)
-          print("Optional Numba image executes OU/Langevin and reproduces saved transport on CPU")
+          print("Optional Numba image executes OU/Langevin/LJ and reanalyzes saved CPU results")
           PYTHON
 
   optional-benchmarks:

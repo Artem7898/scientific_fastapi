@@ -88,6 +88,55 @@
 
 Начальная температура и температура ванны независимы. Ускорение уже включает деление внешней силы на массу. Фрикционный термостат действует в лабораторной системе отсчёта; постоянное ускорение создаёт средний дрейф. Единицы приведённые с `k_B = 1`; модель не калибрует Kelvin, метры или секунды.
 
+## Создать LJ-расчёт взаимодействующих частиц
+
+`POST /simulations/lennard-jones`, `Content-Type: application/json`, модель `lennard-jones-2d-v1`. Приём возвращает `202`, `task_id` и `check_url`; очередь, SSE, отмена и подтверждение попытки общие с другими моделями.
+
+| Поле | Тип JSON | Ограничение | По умолчанию |
+| --- | --- | --- | --- |
+| `num_particles` | integer | `3..4096` | `64` |
+| `box_size` | array из 2 numbers | положительные периодические длины, до `10000*sigma` | `[12, 12]` |
+| `initial_temperature` | number | `0.0001..100*epsilon` | `1` |
+| `epsilon` | number | `0.001..1000` | `1` |
+| `sigma` | number | `0.1..10` | `1` |
+| `mass` | number | `0.1..10` | `1` |
+| `time_step` | number | от `1e-6` до `0.01` умноженных на `sigma*sqrt(mass/epsilon)` | `0.002` |
+| `num_steps` | integer | `1..10000` | `1000` |
+| `ensemble` | string | `nve` или `nvt` | `nve` |
+| `bath_temperature` | number или null | `0.0001..100*epsilon`, обязательна при NVT; запрещена при NVE | `null` |
+| `friction` | number или null | скорость релаксации `0.001..1000`, только NVT | `1` при NVT, иначе `null` |
+| `cutoff_radius` | number | `2*sigma..5*sigma` | `2.5` |
+| `neighbor_skin` | number | `0.05*sigma..sigma` | `0.3` |
+| `interaction_backend` | string | `direct` или `verlet` | `verlet` |
+| `backend` | string | `numpy` или `numba` | `numpy` |
+| `seed` | integer | unsigned 64-bit | `0` |
+| `sample_stride` | integer | `1..10000` | `10` |
+| `equilibration_steps` | integer | `0..num_steps-1`, начало описательной production-статистики | `0` |
+| `rdf_bins` | integer | `8..256` | `64` |
+
+Все числа конечны, типы строгие, неизвестные поля отклоняются. Требуются `cutoff_radius + neighbor_skin < min(box_size)/2` и шаг исходной решётки не меньше `0.95*sigma`. Изменяя `epsilon`, `sigma` или массу, согласуйте cutoff, skin, бокс и шаг времени с выбранным масштабом. Поле `friction` не включает множитель массы.
+
+```json
+{
+  "num_particles": 64,
+  "box_size": [12.0, 12.0],
+  "initial_temperature": 1.0,
+  "ensemble": "nvt",
+  "bath_temperature": 1.0,
+  "friction": 1.0,
+  "time_step": 0.002,
+  "num_steps": 1000,
+  "sample_stride": 10,
+  "equilibration_steps": 500,
+  "seed": 42,
+  "interaction_backend": "verlet"
+}
+```
+
+NVE использует velocity Verlet, NVT — BAOAB с точным OU-подшагом. Потенциал и сила имеют согласованную shifted-force обрезку; хвостовые поправки и внешние поля в этот контракт не входят. Единицы приведённые с `k_B=1`. Инициализация фиксирует кинетическую температуру после удаления скорости центра масс и не считается каноническим равновесием.
+
+До приёма проверяются `N*steps <= 20_000_000`, не больше `1001` кадра и `64 MiB` координатной траектории. Прямой алгоритм дополнительно требует `(steps+2)*N*(N-1)/2 <= 100_000_000`: учтены начальная сила, силы шагов и конечный RDF. Во время исполнения действует общий бюджет проверок пар, включая поиск соседей и анализ; его исчерпание завершается явной ошибкой задания. `backend="numba"` требует extra на API и каждом consumer, как у прежних моделей.
+
 ## Получить статус или результат
 
 `GET /simulations/status/{task_id}` возвращает **200 OK** для известного задания. Ответ представляет одно из состояний:
@@ -155,6 +204,23 @@
 
 Стандартная ошибка доступной оценки рассчитывается delete-one-particle jackknife: исключается вся траектория частицы, а не один коррелированный временной кадр. Она не является доверительным интервалом, не включает смещение конечного окна и не проверяет правильность иной физической модели. Подробная теория, выбор окна и массивы MSD находятся в `transport.json`.
 
+### Результат `lennard-jones-2d-v1`
+
+Общие поля task/attempt/seed/status/steps сохраняются; `model_version` выбирает отдельный контракт результата:
+
+| Поле | Содержание |
+| --- | --- |
+| `ensemble` | `nve` или `nvt` |
+| `thermal_temperature` | `m * sum(|v_i-mean(v)|²) / (2*(N-1))` |
+| `kinetic_energy` | полная кинетическая энергия, неотрицательная |
+| `potential_energy` | сумма shifted-force парных потенциалов, знаковая |
+| `total_energy` | `kinetic_energy + potential_energy`, знаковая |
+| `pressure` | механическое давление `(2K+W)/(2A)`, знаковое |
+| `diagnostics` | фактические проверки пар сил/поиска/RDF, перестроения соседей и бюджет |
+| `artifacts` | `manifest`, `final_state`, `trajectory`, `observables` |
+
+`observables.json` содержит ряды всех энергий, температуры, давления и virial, описательные средние/SD production-кадров, диагностику изменения энергии и RDF конечного снимка. Отрицательные энергия и давление допустимы и не заменяются нулём. Для NVT изменение полной энергии отражает обмен с термостатом; формула стандартной ошибки независимого OU-снимка и свободная теория диффузии здесь не применяются.
+
 ## Прогресс через SSE
 
 `GET /simulations/{task_id}/events` возвращает **200 OK**, `Content-Type: text/event-stream`. Поток наблюдает существующее задание и не запускает новую симуляцию; обычный GET статуса сохраняет прежний контракт.
@@ -214,7 +280,7 @@ curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/cancel
 
 | Поле | Тип JSON | Ограничение | По умолчанию |
 | --- | --- | --- | --- |
-| `model` | string | `ideal-gas-ou-v1` или `langevin-free-v1` | `ideal-gas-ou-v1` |
+| `model` | string | `ideal-gas-ou-v1`, `langevin-free-v1` или `lennard-jones-2d-v1` | `ideal-gas-ou-v1` |
 | `parameters` | object | параметры выбранной модели без `seed`; типы разных моделей не смешиваются | обязательное |
 | `replicas` | integer | `1..50`, строгий тип | `50` |
 | `base_seed` | integer | `0..18_446_744_073_709_551_615`, строгий тип | `0` |
@@ -268,6 +334,8 @@ curl -o ensemble-manifest.json http://localhost:8000/api/v1/ensembles/ENSEMBLE_I
 
 У `ideal-gas-ou-v1` агрегируются `final_temperature` и `total_energy`. У `langevin-free-v1` — `thermal_temperature`, `kinetic_energy` и `final_centered_msd`; `diffusion_estimate` добавляется только при доступной оценке диффузии во всех репликах. Межповторная SD/SE оценки диффузии отличается от её jackknife-ошибки внутри одной реплики.
 
+Для `lennard-jones-2d-v1` агрегируются `thermal_temperature`, `kinetic_energy`, `potential_energy`, `total_energy` и `pressure`; `theoretical_temperature_standard_error` равна `null`. В запросе укажите LJ-модель и её параметры без `seed`. Помимо общих ограничений, суммарная координатная траектория не превышает `512 MiB`, суммарная работа `N*steps*replicas` — `20_000_000`, а для прямого варианта сумма попарной работы — `100_000_000`. SD/SE относятся к независимым репликам; коррелированные временные кадры отдельного расчёта не подменяют их.
+
 Пока остались незавершённые реплики, родитель имеет `pending` или `running`. Когда все реплики терминальны, наличие хотя бы одной ошибки даёт `failed`, иначе наличие отменённых — `cancelled`, иначе `completed`. `require_all` не скрывает неуспешные повторы и не агрегирует только выжившие. Отмена терминального ансамбля даёт `409`; неизвестная или истёкшая запись — `404`.
 
 Каждая статистика содержит `n`, `mean`, `sample_standard_deviation` и `standard_error`. При всех успешных `M >= 2` выборочное SD использует `ddof=1`, а SE равно `SD / sqrt(M)`. При `M=1` среднее доступно, но SD и SE равны `null`. Это эмпирическая неопределённость среднего **между независимыми повторами**; она отличается от теоретической ошибки одного снимка `T/sqrt(N)` и не означает доверительный интервал или валидацию физической модели.
@@ -278,7 +346,7 @@ curl -o ensemble-manifest.json http://localhost:8000/api/v1/ensembles/ENSEMBLE_I
 
 ## Скачать артефакты
 
-`GET /simulations/{task_id}/artifacts/{artifact_name}` возвращает файл из подтверждённой попытки завершённого задания. Передавать `attempt_id` в этот URL не требуется. У `ideal-gas-ou-v1` допустимы `manifest` и `final_state`; у `langevin-free-v1` также `trajectory` и `transport`. Это фиксированные имена, а не произвольные пути:
+`GET /simulations/{task_id}/artifacts/{artifact_name}` возвращает файл из подтверждённой попытки завершённого задания. Передавать `attempt_id` в этот URL не требуется. У `ideal-gas-ou-v1` допустимы `manifest` и `final_state`; у `langevin-free-v1` также `trajectory` и `transport`; у `lennard-jones-2d-v1` — `manifest`, `final_state`, `trajectory`, `observables`. Это фиксированные имена, а не произвольные пути:
 
 ```bash
 curl -o manifest.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/manifest
@@ -298,9 +366,11 @@ curl -o final_state.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifac
 
 В периодической области конечный `positions` обёрнут в бокс, но `unwrapped_positions` и массив `positions` в траектории всегда непрерывны. Для анализа MSD используйте именно траекторию. Артефакты исходного расчёта не являются checkpoint для продолжения RNG/симуляции.
 
+У LJ-модели `final_state.npz` содержит `positions`, `unwrapped_positions` и `velocities`; `trajectory.npz` — непрерывные `positions`, int64 `sample_steps` и float64 `times`. Вместо `transport.json` сохраняется `observables.json`: `series`, `production`, `energy_drift` и `rdf`. Доступ к `transport` у LJ и к `observables` у прежних моделей даёт `404`. RDF нормирован на двумерные площади колец и `N(N-1)/2` уникальных пар; он относится к одному конечному снимку, а не к независимой временной выборке.
+
 ## Создать анализ сохранённых скоростей
 
-`POST /simulations/{task_id}/analyses`, `Content-Type: application/json`. Этот анализ Гаусса/Рэлея принимает только `ideal-gas-ou-v1`; новая модель использует отдельный `transport.json`. Несовместимая модель даёт `409`, без повторного запуска физики и без подмены теории.
+`POST /simulations/{task_id}/analyses`, `Content-Type: application/json`. Этот анализ Гаусса/Рэлея принимает только `ideal-gas-ou-v1`; Langevin использует `transport.json`, LJ — `observables.json`. Несовместимая модель даёт `409`, без повторного запуска физики и без подмены теории.
 
 Анализ использует `final_state.npz` **подтверждённой попытки** задания со статусом `completed`. Перед чтением проверяются связь manifest с результатом, `task_id` и `attempt_id`, SHA256 состояния, форма и конечность массива скоростей и совместимость с моделью `ideal-gas-ou-v1`. Новая симуляция не запускается.
 

@@ -58,7 +58,7 @@ def wait_completed(client, url):
     pytest.fail("Redis task did not complete")
 
 
-@pytest.mark.parametrize("model", ["ideal", "langevin"])
+@pytest.mark.parametrize("model", ["ideal", "langevin", "lj"])
 def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypatch, model):
     from scientific_api.core import queue_manager
 
@@ -76,6 +76,17 @@ def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypat
     if model == "langevin":
         payload.update(bath_temperature=1.0, sample_stride=2, acceleration=[0.5, -0.25])
         endpoint = "/api/v1/simulations/langevin"
+    elif model == "lj":
+        payload = {
+            "num_particles": 36,
+            "box_size": [8.0, 8.0],
+            "initial_temperature": 0.5,
+            "time_step": 0.002,
+            "num_steps": 12,
+            "sample_stride": 3,
+            "seed": PAYLOAD["seed"],
+        }
+        endpoint = "/api/v1/simulations/lennard-jones"
     with TestClient(create_app(settings)) as first:
         accepted = first.post(endpoint, json=payload).json()
         assert entered.wait(2)
@@ -92,6 +103,15 @@ def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypat
             transport = second.get(f"/api/v1/simulations/{accepted['task_id']}/artifacts/transport")
             assert transport.status_code == 200
             assert transport.json()["diffusion"] == result["diffusion"]
+        elif model == "lj":
+            assert result["model_version"] == "lennard-jones-2d-v1"
+            observables = second.get(
+                f"/api/v1/simulations/{accepted['task_id']}/artifacts/observables"
+            )
+            assert observables.status_code == 200
+            assert (
+                observables.json()["series"]["potential_energy"][-1] == result["potential_energy"]
+            )
 
 
 def test_polling_across_two_app_instances(settings):
