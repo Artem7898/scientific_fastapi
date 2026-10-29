@@ -198,3 +198,109 @@ def test_nonfinite_or_missing_contributions_are_not_counted_as_scientific_succes
 def test_ensemble_contract_rejects_malformed_inputs_and_excess_total_work(patch):
     with pytest.raises(ValidationError):
         EnsembleRequest.model_validate({**PAYLOAD, **patch})
+
+
+def langevin_snapshot(*, diffusion_available: bool = True) -> dict:
+    request = EnsembleRequest.model_validate(
+        {
+            "model": "langevin-free-v1",
+            "parameters": {
+                "initial_temperature": 1e-6,
+                "bath_temperature": 1e6,
+                "num_particles": 3,
+                "friction": 1e-3,
+                "time_step": 1e-6,
+                "num_steps": 1,
+                "sample_stride": 1,
+            },
+            "replicas": 2,
+        }
+    )
+    children, metadata = prepare_ensemble(request, ensemble_id="langevin")
+    return {
+        "ensemble_id": "langevin",
+        "metadata": metadata,
+        "children": [identifier for identifier, _ in children],
+        "results": {
+            identifier: {
+                "task_id": identifier,
+                "status": "completed",
+                "seed": parameters["seed"],
+                "thermal_temperature": 0.002,
+                "kinetic_energy": 0.004,
+                "final_centered_msd": 0.001,
+                "diffusion": {
+                    "status": "available" if diffusion_available else "unavailable",
+                    "estimate": -0.1 if diffusion_available else None,
+                },
+            }
+            for identifier, parameters in children
+        },
+    }
+
+
+def test_langevin_ensemble_transient_temperature_error_is_stable_at_cold_hot_corner():
+    source = langevin_snapshot()
+    result = aggregate_ensemble(source)
+    expected_temperature = 1e-6 * math.exp(-2e-9) + 1e6 * -math.expm1(-2e-9)
+    assert result["theoretical_temperature_standard_error"] == expected_temperature / 2.0
+    assert result["statistics"]["diffusion_estimate"]["mean"] == -0.1
+    assert all(
+        "model" in payload
+        for _, payload in prepare_ensemble(
+            EnsembleRequest.model_validate(source["metadata"]["request"]), ensemble_id="recreated"
+        )[0]
+    )
+    manifest = ensemble_manifest(source)
+    assert (
+        "T_velocity(t)" in manifest["statistics_method"]["theoretical_temperature_standard_error"]
+    )
+
+
+def test_langevin_ensemble_requires_every_diffusion_fit_before_aggregating_diffusion():
+    source = langevin_snapshot()
+    child = source["children"][0]
+    source["results"][child]["diffusion"] = {"status": "unavailable", "estimate": None}
+    result = aggregate_ensemble(source)
+    assert result["status"] == "completed"
+    assert set(result["statistics"]) == {
+        "thermal_temperature",
+        "kinetic_energy",
+        "final_centered_msd",
+    }
+
+
+@pytest.mark.parametrize(
+    "model,parameters",
+    [
+        ("langevin-free-v1", PAYLOAD["parameters"]),
+        ("ideal-gas-ou-v1", {**PAYLOAD["parameters"], "bath_temperature": 300.0}),
+    ],
+)
+def test_ensemble_model_must_match_its_physical_parameter_contract(model, parameters):
+    with pytest.raises(ValidationError):
+        EnsembleRequest.model_validate({"model": model, "parameters": parameters, "replicas": 2})
+
+
+def test_langevin_ensemble_caps_aggregate_sampled_trajectory_bytes_before_allocation():
+    parameters = {
+        "initial_temperature": 1.0,
+        "bath_temperature": 1.0,
+        "num_particles": 524_288,
+        "num_steps": 3,
+        "sample_stride": 1,
+    }
+    # Four frames per child times 16 children is exactly 512 MiB; this
+    # contract check constructs no scientific state or trajectory arrays.
+    request = EnsembleRequest.model_validate(
+        {"model": "langevin-free-v1", "parameters": parameters, "replicas": 16}
+    )
+    assert request.parameters.num_particles == 524_288
+    with pytest.raises(ValidationError, match="512 MiB"):
+        EnsembleRequest.model_validate(
+            {
+                "model": "langevin-free-v1",
+                "parameters": {**parameters, "num_particles": 524_289},
+                "replicas": 16,
+            }
+        )

@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from ..schemas.ensemble import EnsembleRequest, EnsembleStatus
+from ..schemas.langevin import LangevinEnsembleParameters
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
@@ -52,7 +53,11 @@ def prepare_ensemble(
     children = [
         (
             f"{ensemble_id}_r{index:03d}",
-            {**request.parameters.model_dump(), "seed": seed},
+            {
+                **({"model": request.model} if request.model != "ideal-gas-ou-v1" else {}),
+                **request.parameters.model_dump(),
+                "seed": seed,
+            },
         )
         for index, seed in enumerate(seeds)
     ]
@@ -139,19 +144,42 @@ def aggregate_ensemble(snapshot: dict[str, Any]) -> dict[str, Any]:
     theoretical_error = None
     if status == "completed":
         statistics = {}
-        for metric in ("final_temperature", "total_energy"):
+        metrics = (
+            ("final_temperature", "total_energy")
+            if request.model == "ideal-gas-ou-v1"
+            else ("thermal_temperature", "kinetic_energy", "final_centered_msd")
+        )
+        if request.model == "langevin-free-v1" and all(
+            child["result"].get("diffusion", {}).get("status") == "available" for child in children
+        ):
+            metrics = (*metrics, "diffusion_estimate")
+        for metric in metrics:
             values = []
             for child in children:
-                value = child["result"][metric]
+                value = (
+                    child["result"]["diffusion"]["estimate"]
+                    if metric == "diffusion_estimate"
+                    else child["result"][metric]
+                )
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError("Ensemble contribution has a nonnumeric observable")
                 if not math.isfinite(value):
                     raise ValueError("Ensemble contribution has a nonfinite observable")
                 values.append(float(value))
             statistics[metric] = _statistic(values)
-        theoretical_error = request.parameters.initial_temperature / math.sqrt(
-            request.parameters.num_particles * request.replicas
-        )
+        if isinstance(request.parameters, LangevinEnsembleParameters):
+            parameters = request.parameters
+            exponent = -2 * parameters.friction * parameters.num_steps * parameters.time_step
+            thermal_temperature = parameters.initial_temperature * math.exp(exponent) + (
+                parameters.bath_temperature * -math.expm1(exponent)
+            )
+            theoretical_error = thermal_temperature / math.sqrt(
+                (parameters.num_particles - 1) * request.replicas
+            )
+        else:
+            theoretical_error = request.parameters.initial_temperature / math.sqrt(
+                request.parameters.num_particles * request.replicas
+            )
     return EnsembleStatus.model_validate(
         {
             "ensemble_id": snapshot["ensemble_id"],
@@ -181,7 +209,11 @@ def ensemble_manifest(snapshot: dict[str, Any]) -> dict[str, Any]:
             "contribution": "One committed terminal result per logical replica in replica-index order",
             "sample_standard_deviation": "ddof=1; unavailable for one replica",
             "standard_error": "Sample standard deviation divided by sqrt(n); unavailable for one replica",
-            "theoretical_temperature_standard_error": "T_target / sqrt(N * M), independent equilibrium 2D snapshots",
+            "theoretical_temperature_standard_error": (
+                "T_target / sqrt(N * M), independent equilibrium 2D snapshots"
+                if result["model"] == "ideal-gas-ou-v1"
+                else "T_velocity(t) / sqrt((N - 1) * M), independent 2D Gaussian velocity fluctuations about sample flow"
+            ),
             "failure_policy": "require_all; no survivor-only aggregate",
             "limitations": "No confidence interval or physical-model validation is implied",
         },

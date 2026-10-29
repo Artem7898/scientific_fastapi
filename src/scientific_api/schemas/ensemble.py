@@ -4,8 +4,12 @@ from typing import Any, Literal
 
 from pydantic import Field, FiniteFloat, StrictInt, model_validator
 
+from ..domain.langevin import LangevinParameters
 from ..domain.simulation import ComputeBackend
+from .langevin import LangevinEnsembleParameters
 from .simulation import StrictModel
+
+MAX_ENSEMBLE_TRAJECTORY_BYTES = 512 * 1024 * 1024
 
 
 class EnsembleParameters(StrictModel):
@@ -19,17 +23,29 @@ class EnsembleParameters(StrictModel):
 
 
 class EnsembleRequest(StrictModel):
-    model: Literal["ideal-gas-ou-v1"] = "ideal-gas-ou-v1"
-    parameters: EnsembleParameters
+    model: Literal["ideal-gas-ou-v1", "langevin-free-v1"] = "ideal-gas-ou-v1"
+    parameters: EnsembleParameters | LangevinEnsembleParameters
     replicas: StrictInt = Field(default=50, ge=1, le=50)
     base_seed: StrictInt = Field(default=0, ge=0, le=2**64 - 1)
     failure_policy: Literal["require_all"] = "require_all"
 
     @model_validator(mode="after")
     def bound_work(self) -> "EnsembleRequest":
+        expected = (
+            EnsembleParameters if self.model == "ideal-gas-ou-v1" else LangevinEnsembleParameters
+        )
+        if not isinstance(self.parameters, expected):
+            raise ValueError("parameters do not match the requested model")
         work = self.replicas * self.parameters.num_particles * self.parameters.num_steps
         if work > 100_000_000:
             raise ValueError("replicas * num_particles * num_steps must not exceed 100000000")
+        if isinstance(self.parameters, LangevinEnsembleParameters):
+            # The ensemble parameter contract deliberately has no seed. Its
+            # validated sampling schedule is independent of the eventual seed.
+            physics = LangevinParameters(**self.parameters.model_dump(), seed=0)
+            trajectory_bytes = len(physics.sampling_steps()) * physics.num_particles * 2 * 8
+            if self.replicas * trajectory_bytes > MAX_ENSEMBLE_TRAJECTORY_BYTES:
+                raise ValueError("ensemble sampled position trajectories must not exceed 512 MiB")
         return self
 
 
@@ -67,11 +83,24 @@ class EnsembleStatus(StrictModel):
     ensemble_id: str
     status: Literal["pending", "running", "completed", "failed", "cancelled"]
     cancel_requested: bool
-    model: Literal["ideal-gas-ou-v1"]
+    model: Literal["ideal-gas-ou-v1", "langevin-free-v1"]
     failure_policy: Literal["require_all"]
     counts: EnsembleCounts
     children: list[EnsembleChild]
-    statistics: dict[Literal["final_temperature", "total_energy"], EnsembleStatistic] | None
+    statistics: (
+        dict[
+            Literal[
+                "final_temperature",
+                "total_energy",
+                "thermal_temperature",
+                "kinetic_energy",
+                "final_centered_msd",
+                "diffusion_estimate",
+            ],
+            EnsembleStatistic,
+        ]
+        | None
+    )
     theoretical_temperature_standard_error: FiniteFloat | None = Field(ge=0)
 
 

@@ -39,6 +39,29 @@ The service responds with `202 Accepted`:
 
 Poll `check_url`. The same `task_id` passes through `pending`, `running`, and `completed` or `failed`/`cancelled`. A completed response includes temperature, energy, temperature standard error, model version, seed, and artifact references. See the [API reference](docs/api_reference.md) for the complete contract and limits.
 
+## Positions, an external field and diffusion
+
+The separate `langevin-free-v1` model adds positions and constant external acceleration. Initial temperature, bath temperature, mass and relaxation rate are specified independently; the original `ideal-gas-ou-v1` model is retained.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/langevin \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_temperature":1.0,"bath_temperature":1.0,"num_particles":1000,"time_step":0.02,"num_steps":1000,"seed":42,"acceleration":[0.1,0.0],"sample_stride":10,"diffusion_fit_start_step":500,"diffusion_fit_end_step":1000}'
+```
+
+The `202` response contains the same `check_url`; SSE, cancellation, standalone workers and ensembles also support this model. Download four artifacts after `completed`:
+
+```bash
+curl -o manifest.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/manifest
+curl -o final_state.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/final_state
+curl -o trajectory.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/trajectory
+curl -o transport.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/transport
+```
+
+`transport.json` contains mean displacement, MSD, centered MSD and a diffusion estimate. Centering separates mean drift from fluctuations. The fit needs at least three saved points after initial transients have decayed and checks its theoretical finite-window bias. Short runs explicitly report an unavailable estimate. The standard error uses a delete-one-particle jackknife, retaining temporal correlations within each independent particle trajectory.
+
+Space is unbounded by default. Add `"boundary":"periodic","box_size":[5.0,5.0]` for a periodic domain. Terminal `positions` lie inside the box, while the trajectory stores continuous unwrapped coordinates, so boundary crossings do not create artificial MSD saturation. Frame count and memory are bounded. See the [development guide](docs/development.md#координаты-поля-и-анализ-переноса) for assumptions and saved-trajectory reanalysis.
+
 ## Optional Numba execution
 
 NumPy remains the default and reference implementation. To use the CPU Numba backend, install its extra in the API environment and every worker consuming the same queue:
@@ -56,7 +79,7 @@ Choose a backend using the [runtime benchmark](docs/development.md#benchmark) on
 
 ## Analyze a saved simulation
 
-After `status="completed"`, analyze the saved velocities without running another simulation. JSON analysis works with the minimal installation:
+After `status="completed"` for `ideal-gas-ou-v1`, analyze the saved velocities without running another simulation. `langevin-free-v1` uses its separate `transport.json`, since flow and a nonequilibrium initial temperature require a different reference. JSON analysis works with the minimal installation:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/analyses \
@@ -102,6 +125,8 @@ The `202` response includes `ensemble_id` and `check_url`. Read status through `
 
 All seeds are saved before execution, and admission reserves capacity for every replica atomically. The total budget counts `replicas * num_particles * num_steps`; existing workers execute the jobs. An optional `Idempotency-Key` returns the same ensemble on retry; conflicting parameters produce `409`. With `require_all`, failures and cancellations remain explicit and no survivor-only aggregate is reported. Sample SD (`ddof=1`) and the mean's SE require all replicas to succeed and `M >= 2`; both are `null` for one replica. These estimates across independent replicas differ from the single-snapshot theoretical error `T/sqrt(N)`.
 
+For transport studies, set `"model":"langevin-free-v1"` and put the new endpoint's parameters without `seed` inside `parameters`. Ensemble statistics follow the selected model; kinetic energy from drift is kept separate from thermal temperature.
+
 ## Reproducibility
 
 - Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
@@ -109,7 +134,7 @@ All seeds are saved before execution, and admission reserves capacity for every 
 - `uv.lock` fixes resolved dependencies; `uv sync --frozen` installs without regenerating the lockfile. A `pylock.toml` export supports tools implementing PEP 751.
 - Tests check repeatability in a fixed environment, analytical properties of the model, the API contract, and research artifact generation.
 
-A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of independent particles in this model; it does not include physical model error or measurement uncertainty.
+A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of `ideal-gas-ou-v1`. The new model distinguishes thermal-temperature uncertainty, diffusion estimation and between-replica statistics; these quantities do not include physical model error or measurement uncertainty.
 
 ## Optional dependencies
 
