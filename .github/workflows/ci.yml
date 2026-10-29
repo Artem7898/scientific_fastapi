@@ -150,6 +150,70 @@ jobs:
               json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest}, stream)
           print("Container validation, task, attempt isolation and artifact hash passed")
           PYTHON
+      - name: Verify Langevin HTTP results and transport artifacts
+        run: |
+          python - <<'PYTHON'
+          import hashlib
+          import io
+          import json
+          import time
+          import urllib.request
+          import zipfile
+
+          base = "http://127.0.0.1:8000"
+          payload = {
+              "initial_temperature": 1.0, "bath_temperature": 1.0,
+              "num_particles": 32, "num_steps": 100, "time_step": 0.1,
+              "sample_stride": 10, "seed": 42, "acceleration": [0.5, -0.25],
+              "boundary": "periodic", "box_size": [1.0, 1.0],
+          }
+          request = urllib.request.Request(
+              base + "/api/v1/simulations/langevin", data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              accepted = json.load(response)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              with urllib.request.urlopen(base + accepted["check_url"], timeout=5) as response:
+                  result = json.load(response)
+              if result["status"] == "completed":
+                  break
+              assert result["status"] in {"pending", "running"}, result
+              time.sleep(0.1)
+          else:
+              raise AssertionError("Container Langevin task did not finish")
+          assert result["task_id"] == accepted["task_id"]
+          assert result["model_version"] == "langevin-free-v1"
+          assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
+          artifact = base + "/api/v1/simulations/" + result["task_id"] + "/artifacts/"
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              manifest = json.load(response)
+          assert manifest["model"]["version"] == "langevin-free-v1"
+          assert manifest["parameters"]["acceleration"] == payload["acceleration"]
+          assert manifest["execution"]["backend"] == "numpy"
+          assert manifest["sampling"]["coordinate_convention"] == "unwrapped"
+          records = {entry["path"]: entry for entry in manifest["artifacts"]}
+          hashes = {}
+          artifacts = {}
+          for name in ("trajectory", "transport"):
+              with urllib.request.urlopen(artifact + name, timeout=5) as response:
+                  artifacts[name] = response.read()
+              hashes[name] = hashlib.sha256(artifacts[name]).hexdigest()
+              assert hashes[name] == records[result["artifacts"][name]]["sha256"]
+          transport = json.loads(artifacts["transport"])
+          assert transport["model_version"] == result["model_version"]
+          assert transport["coordinate_convention"] == "unwrapped"
+          assert transport["msd"][-1] == result["final_msd"]
+          assert transport["centered_msd"][-1] == result["final_centered_msd"]
+          assert transport["sample_steps"] == list(range(0, 101, 10))
+          with zipfile.ZipFile(io.BytesIO(artifacts["trajectory"])) as archive:
+              assert set(archive.namelist()) == {"positions.npy", "sample_steps.npy", "times.npy"}
+          with open("/tmp/container-langevin-task.json", "w") as stream:
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "hashes": hashes}, stream)
+          print("Langevin HTTP response, sampled trajectory and transport checksums passed")
+          PYTHON
       - name: Verify task state and artifacts survive API and Redis restart
         run: |
           docker compose restart redis api
@@ -168,7 +232,16 @@ jobs:
           assert result["attempt_id"] == expected["attempt_id"]
           with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/final_state", timeout=5) as response:
               assert hashlib.sha256(response.read()).hexdigest() == expected["sha256"]
-          print("Persisted Redis state and artifact volume survived restart")
+          with open("/tmp/container-langevin-task.json") as stream:
+              expected = json.load(stream)
+          with urllib.request.urlopen(base + "status/" + expected["task_id"], timeout=5) as response:
+              result = json.load(response)
+          assert result["status"] == "completed" and result["model_version"] == "langevin-free-v1"
+          assert result["attempt_id"] == expected["attempt_id"]
+          for name, digest in expected["hashes"].items():
+              with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
+                  assert hashlib.sha256(response.read()).hexdigest() == digest
+          print("OU/Langevin Redis state and artifact volumes survived restart")
           PYTHON
       - name: Verify separate worker, ensembles and SSE in the container stack
         run: |
@@ -261,7 +334,9 @@ jobs:
 
           import numpy as np
           import scientific_api
+          from scientific_api.domain.langevin import LangevinParameters
           from scientific_api.domain.simulation import SimulationParameters
+          from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
           from scientific_api.services.simulation_service import run_simulation
 
           assert importlib.util.find_spec("jax") is None
@@ -291,15 +366,72 @@ jobs:
                   assert hashlib.sha256(state_path.read_bytes()).hexdigest() == manifest["artifacts"][0]["sha256"]
                   manifests[backend] = manifest
               np.testing.assert_allclose(states["numba"], states["numpy"], rtol=1e-11, atol=1e-11)
-          execution = manifests["numba"]["execution"]
-          assert execution["backend_version"] == importlib.metadata.version("numba")
-          assert execution["llvmlite_version"] == importlib.metadata.version("llvmlite")
-          assert execution["llvm_version"]
-          assert execution["device"] == "cpu" and execution["dtype"] == "float64"
-          assert execution["fastmath"] is False and execution["parallel"] is False
-          assert execution["cache"] is False and execution["nogil"] is True
+              langevin_states = {}
+              langevin_trajectories = {}
+              langevin_manifests = {}
+              for backend in ("numpy", "numba"):
+                  parameters = LangevinParameters(
+                      1.0, 1.0, 32, num_steps=100, time_step=0.1, sample_stride=10,
+                      acceleration=(0.5, -0.25), boundary="periodic", box_size=(1.0, 1.0),
+                      seed=42, backend=backend,
+                  )
+                  result = run_simulation(
+                      parameters, task_id="langevin_" + backend,
+                      attempt_id="runtime", artifacts_dir=root,
+                  )
+                  assert result["status"] == "completed" and result["model_version"] == "langevin-free-v1"
+                  assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
+                  with (root / result["artifacts"]["manifest"]).open() as stream:
+                      manifest = json.load(stream)
+                  assert manifest["model"]["version"] == "langevin-free-v1"
+                  assert manifest["parameters"]["backend"] == manifest["execution"]["backend"] == backend
+                  assert manifest["parameters"]["acceleration"] == [0.5, -0.25]
+                  assert manifest["sampling"]["coordinate_convention"] == "unwrapped"
+                  records = {entry["path"]: entry for entry in manifest["artifacts"]}
+                  for path, record in records.items():
+                      assert hashlib.sha256((root / path).read_bytes()).hexdigest() == record["sha256"]
+                  trajectory = load_trajectory_state(
+                      root / result["artifacts"]["trajectory"],
+                      expected_sha256=records[result["artifacts"]["trajectory"]]["sha256"],
+                      expected_particles=parameters.num_particles,
+                      expected_sample_steps=parameters.sampling_steps(),
+                      expected_time_step=parameters.time_step,
+                  )
+                  assert trajectory["positions"].shape == (11, 32, 2)
+                  assert trajectory["sample_steps"].dtype == np.int64
+                  assert trajectory["times"].dtype == np.float64
+                  with np.load(root / result["artifacts"]["final_state"], allow_pickle=False) as state:
+                      arrays = {name: state[name].copy() for name in state.files}
+                  assert set(arrays) == {"positions", "unwrapped_positions", "velocities"}
+                  assert ((arrays["positions"] >= 0) & (arrays["positions"] < 1)).all()
+                  np.testing.assert_allclose(arrays["positions"], np.remainder(arrays["unwrapped_positions"], 1.0))
+                  np.testing.assert_array_equal(trajectory["positions"][-1], arrays["unwrapped_positions"])
+                  assert (np.abs(trajectory["positions"]) > 1).any()
+                  observed = analyze_transport(
+                      trajectory["positions"], trajectory["sample_steps"], parameters=parameters
+                  )
+                  with (root / result["artifacts"]["transport"]).open() as stream:
+                      saved = json.load(stream)
+                  assert observed == saved
+                  assert saved["msd"][-1] == result["final_msd"]
+                  assert saved["centered_msd"][-1] == result["final_centered_msd"]
+                  assert saved["diffusion"]["status"] == "available"
+                  langevin_states[backend] = arrays
+                  langevin_trajectories[backend] = trajectory["positions"]
+                  langevin_manifests[backend] = manifest
+              for name in ("positions", "unwrapped_positions", "velocities"):
+                  np.testing.assert_allclose(langevin_states["numba"][name], langevin_states["numpy"][name], rtol=1e-11, atol=1e-11)
+              np.testing.assert_allclose(langevin_trajectories["numba"], langevin_trajectories["numpy"], rtol=1e-11, atol=1e-11)
+          for manifest in (manifests["numba"], langevin_manifests["numba"]):
+              execution = manifest["execution"]
+              assert execution["backend_version"] == importlib.metadata.version("numba")
+              assert execution["llvmlite_version"] == importlib.metadata.version("llvmlite")
+              assert execution["llvm_version"]
+              assert execution["device"] == "cpu" and execution["dtype"] == "float64"
+              assert execution["fastmath"] is False and execution["parallel"] is False
+              assert execution["cache"] is False and execution["nogil"] is True
           assert not any(name.split(".", 1)[0] in {"jax", "jaxlib"} for name in sys.modules)
-          print("Optional Numba image executes the real service and agrees with NumPy on CPU")
+          print("Optional Numba image executes OU/Langevin and reproduces saved transport on CPU")
           PYTHON
 
   optional-benchmarks:

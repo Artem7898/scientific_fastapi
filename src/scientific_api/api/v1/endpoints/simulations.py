@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from ....core.queue_manager import QueueManager
 from ....core.task_store import QueueFull
 from ....models.computation import BackendUnavailable, require_backend
+from ....schemas.langevin import LangevinRequest
 from ....schemas.simulation import (
     SimulationRequest,
     TaskAcceptedResponse,
@@ -35,6 +36,28 @@ async def submit_simulation(
     response: Response,
     manager: Manager,
 ) -> TaskAcceptedResponse:
+    return await _admit_simulation(payload, response, manager)
+
+
+@router.post(
+    "/langevin",
+    response_model=TaskAcceptedResponse,
+    status_code=202,
+    summary="Submit exact 2D Langevin motion, drift and transport diagnostics",
+)
+async def submit_langevin(
+    payload: LangevinRequest,
+    response: Response,
+    manager: Manager,
+) -> TaskAcceptedResponse:
+    return await _admit_simulation(payload, response, manager)
+
+
+async def _admit_simulation(
+    payload: SimulationRequest | LangevinRequest,
+    response: Response,
+    manager: QueueManager,
+) -> TaskAcceptedResponse:
     if payload.num_steps > manager.settings.max_simulation_iterations:
         raise HTTPException(422, "num_steps exceeds the configured iteration limit")
     if payload.num_particles * payload.num_steps > manager.settings.max_particle_steps:
@@ -45,7 +68,10 @@ async def submit_simulation(
         raise HTTPException(503, str(exc)) from None
     task_id = uuid.uuid4().hex
     try:
-        await manager.submit(task_id, payload.model_dump())
+        task_payload = payload.model_dump()
+        if isinstance(payload, LangevinRequest):
+            task_payload = {"model": "langevin-free-v1", **task_payload}
+        await manager.submit(task_id, task_payload)
     except QueueFull:
         raise HTTPException(
             429, "Task capacity is exhausted; retry later", headers={"Retry-After": "1"}
@@ -90,11 +116,11 @@ def _valid_task_id(task_id: str) -> bool:
 
 @router.get(
     "/{task_id}/artifacts/{artifact_name}",
-    summary="Download the run manifest or its terminal velocity state",
+    summary="Download a committed model-specific run artifact",
 )
 async def get_artifact(
     task_id: str,
-    artifact_name: Literal["manifest", "final_state"],
+    artifact_name: Literal["manifest", "final_state", "trajectory", "transport"],
     request: Request,
     manager: Manager,
 ) -> FileResponse:
@@ -105,10 +131,12 @@ async def get_artifact(
     attempt_id = result.get("attempt_id", "")
     if not _valid_task_id(attempt_id):
         raise HTTPException(404, "Artifact not found")
-    expected = {
-        "manifest": f"{task_id}/{attempt_id}/manifest.json",
-        "final_state": f"{task_id}/{attempt_id}/final_state.npz",
-    }[artifact_name]
+    filenames = {"manifest": "manifest.json", "final_state": "final_state.npz"}
+    if result.get("model_version") == "langevin-free-v1":
+        filenames.update(trajectory="trajectory.npz", transport="transport.json")
+    if artifact_name not in filenames:
+        raise HTTPException(404, "Artifact not found")
+    expected = f"{task_id}/{attempt_id}/{filenames[artifact_name]}"
     if result.get("artifacts", {}).get(artifact_name) != expected:
         raise HTTPException(404, "Artifact not found")
     try:
@@ -120,7 +148,7 @@ async def get_artifact(
     return FileResponse(
         path,
         media_type="application/json"
-        if artifact_name == "manifest"
+        if artifact_name in {"manifest", "transport"}
         else "application/octet-stream",
         filename=path.name,
     )

@@ -11,7 +11,9 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from ..domain.simulation import SimulationCancelled, SimulationParameters
+from ..domain.experiments import parameters_from_payload
+from ..domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
+from ..domain.simulation import SimulationCancelled
 from ..services.simulation_service import run_simulation
 from .config import Settings
 from .experiment_tracker import ExperimentTracker
@@ -152,7 +154,7 @@ class QueueManager:
                 kind="consumer",
             ):
                 self.telemetry.observe_queue_wait(time.time() - job.submitted_at)
-                parameters = SimulationParameters(**job.payload)
+                parameters = parameters_from_payload(job.payload)
                 context = contextvars.copy_context()
                 function = partial(
                     run_simulation,
@@ -168,9 +170,19 @@ class QueueManager:
                     self._executor, context.run, function
                 )
                 result = await asyncio.shield(computation)
-                for name in ("final_temperature", "total_energy", "temperature_standard_error"):
+                metrics = (
+                    ("thermal_temperature", "kinetic_energy", "thermal_temperature_standard_error")
+                    if isinstance(parameters, LangevinParameters)
+                    else ("final_temperature", "total_energy", "temperature_standard_error")
+                )
+                for name in metrics:
                     if not math.isfinite(result[name]):
                         raise FloatingPointError("Simulation produced a nonfinite result")
+                if (
+                    isinstance(parameters, LangevinParameters)
+                    and result.get("model_version") != LANGEVIN_MODEL_VERSION
+                ):
+                    raise ValueError("Scientific result has the wrong model version")
                 if result.get("task_id") != job.task_id or result.get("status") != "completed":
                     raise ValueError("Scientific result violates the task contract")
                 committed = await self._finish(job, result)

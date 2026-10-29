@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add the separate `langevin-free-v1` model with exact joint position/velocity transitions, independent initial/bath temperatures, mass, relaxation rate, and constant external acceleration.
+- Preserve continuous coordinates across periodic boundaries and persist bounded sampled trajectories, terminal positions/velocities, transport diagnostics, and SHA256-linked model provenance.
+- Report raw and unbiased centered MSD, drift, thermal temperature, and diffusion estimates with transient/bias gates and delete-one-particle jackknife uncertainty.
+- Support model-specific simulation and ensemble contracts through the existing workers, retry, cancellation, SSE, and artifact workflows while retaining the original OU model.
+- Keep diffusion explicitly unavailable for unsuitable observation windows and provide verified saved-trajectory reanalysis without rerunning physics.
 - Add an explicit optional Numba CPU backend for simulations and ensembles, with persisted backend selection, lazy loading, and no implicit fallback from failed execution.
 - Keep NumPy as the default reference and PCG64 innovations common to both implementations; record backend/kernel versions, device, dtype, arithmetic, and RNG policy in run manifests.
 - Sample terminal observables without redundant per-step reductions, while retaining step-boundary cancellation and progress behavior.

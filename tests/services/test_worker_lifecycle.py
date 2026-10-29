@@ -218,12 +218,23 @@ def test_cli_configuration_error_does_not_echo_credentials(tmp_path: Path) -> No
     reason="SCIENTIFIC_TEST_REDIS_URI is not configured",
 )
 @pytest.mark.parametrize("backend_name", ["numpy", "numba"])
+@pytest.mark.parametrize("model_version", ["ideal-gas-ou-v1", "langevin-free-v1"])
 def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
-    tmp_path: Path, backend_name: str
+    tmp_path: Path, backend_name: str, model_version: str
 ) -> None:
     if backend_name == "numba":
         pytest.importorskip("numba")
     payload = {**PAYLOAD, "backend": backend_name}
+    endpoint = "/api/v1/simulations/monte-carlo"
+    if model_version == "langevin-free-v1":
+        payload.update(
+            bath_temperature=1.0,
+            sample_stride=1,
+            acceleration=[0.5, -0.25],
+            boundary="periodic",
+            box_size=[1.0, 1.0],
+        )
+        endpoint = "/api/v1/simulations/langevin"
     redis = pytest.importorskip("redis")
     uri = os.environ["SCIENTIFIC_TEST_REDIS_URI"]
     namespace = "scientific-api-external-worker-" + uuid4().hex
@@ -246,7 +257,9 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
     try:
         with TestClient(create_app(settings)) as client:
             assert not client.app.state.queue_manager.ready
-            accepted = client.post("/api/v1/simulations/monte-carlo", json=payload).json()
+            submitted = client.post(endpoint, json=payload)
+            assert submitted.status_code == 202, submitted.text
+            accepted = submitted.json()
             assert client.get(accepted["check_url"]).json()["status"] == "pending"
             pending = client.app.state.backend.events(accepted["task_id"])
             assert pending["snapshot"]["phase"] == "pending"
@@ -277,6 +290,13 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
             assert artifact.json()["outputs"] == result
             assert artifact.json()["parameters"]["backend"] == backend_name
             assert artifact.json()["execution"]["backend"] == backend_name
+            assert artifact.json()["model"]["version"] == model_version
+            if model_version == "langevin-free-v1":
+                transport = client.get(
+                    f"/api/v1/simulations/{result['task_id']}/artifacts/transport"
+                )
+                assert transport.status_code == 200
+                assert transport.json()["centered_msd"][-1] == result["final_centered_msd"]
 
             # A fresh API instance reads durable events and results produced by
             # the separate worker process, rather than relying on local state.
@@ -300,6 +320,7 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
                 submission = second.post(
                     "/api/v1/ensembles",
                     json={
+                        "model": model_version,
                         "parameters": {
                             key: value for key, value in payload.items() if key != "seed"
                         },
@@ -334,6 +355,7 @@ def test_standalone_worker_process_consumes_api_jobs_and_handles_sigterm(
                     assert committed.json()["outputs"] == child
                     assert committed.json()["parameters"]["backend"] == backend_name
                     assert committed.json()["execution"]["backend"] == backend_name
+                    assert committed.json()["model"]["version"] == model_version
             process.terminate()
             output, _ = process.communicate(timeout=10)
             assert process.returncode == 0, output

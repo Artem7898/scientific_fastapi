@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model_validator
 
 from ..domain.simulation import ComputeBackend, SimulationParameters
+from .langevin import LangevinResponse
 
 
 class StrictModel(BaseModel):
@@ -54,7 +55,7 @@ class SimulationResponse(StrictModel):
     final_temperature: FiniteFloat = Field(ge=0)
     total_energy: FiniteFloat = Field(ge=0)
     temperature_standard_error: FiniteFloat = Field(ge=0)
-    model_version: str
+    model_version: Literal["ideal-gas-ou-v1"]
     seed: StrictInt
     num_steps: StrictInt
     units: dict[str, str]
@@ -67,6 +68,9 @@ class TaskFailed(StrictModel):
     error: str
 
 
+CompletedSimulationResponse = Annotated[
+    SimulationResponse | LangevinResponse, Field(discriminator="model_version")
+]
 TaskStatusResponse = Annotated[
-    TaskInProgress | SimulationResponse | TaskFailed, Field(discriminator="status")
+    TaskInProgress | CompletedSimulationResponse | TaskFailed, Field(discriminator="status")
 ]

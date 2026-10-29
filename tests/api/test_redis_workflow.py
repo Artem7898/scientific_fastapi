@@ -58,7 +58,8 @@ def wait_completed(client, url):
     pytest.fail("Redis task did not complete")
 
 
-def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypatch):
+@pytest.mark.parametrize("model", ["ideal", "langevin"])
+def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypatch, model):
     from scientific_api.core import queue_manager
 
     original = queue_manager.run_simulation
@@ -70,8 +71,13 @@ def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypat
         return original(*args, **kwargs)
 
     monkeypatch.setattr(queue_manager, "run_simulation", interrupted)
+    payload = dict(PAYLOAD)
+    endpoint = "/api/v1/simulations/monte-carlo"
+    if model == "langevin":
+        payload.update(bath_temperature=1.0, sample_stride=2, acceleration=[0.5, -0.25])
+        endpoint = "/api/v1/simulations/langevin"
     with TestClient(create_app(settings)) as first:
-        accepted = first.post("/api/v1/simulations/monte-carlo", json=PAYLOAD).json()
+        accepted = first.post(endpoint, json=payload).json()
         assert entered.wait(2)
         assert first.get(accepted["check_url"]).json()["status"] == "running"
     monkeypatch.setattr(queue_manager, "run_simulation", original)
@@ -81,6 +87,11 @@ def test_redis_task_requeued_on_shutdown_finishes_in_new_app(settings, monkeypat
         manifest = second.get(f"/api/v1/simulations/{accepted['task_id']}/artifacts/manifest")
         assert manifest.status_code == 200
         assert manifest.json()["parameters"]["seed"] == PAYLOAD["seed"]
+        if model == "langevin":
+            assert result["model_version"] == "langevin-free-v1"
+            transport = second.get(f"/api/v1/simulations/{accepted['task_id']}/artifacts/transport")
+            assert transport.status_code == 200
+            assert transport.json()["diffusion"] == result["diffusion"]
 
 
 def test_polling_across_two_app_instances(settings):
