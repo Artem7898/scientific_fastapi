@@ -7,9 +7,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from ....core.analysis_manager import AnalysisCapacityError, AnalysisManager
+from ....core.task_store import MAX_ARCHIVED_ANALYSES, ArchiveCapacityError
 from ....research.reporting import ResearchDependencyError
 from ....schemas.analysis import AnalysisArtifact, VelocityAnalysisRequest, VelocityAnalysisResponse
-from ....services.analysis_service import AnalysisSourceError, read_analysis_artifact
+from ....services.analysis_service import (
+    AnalysisArchiveError,
+    AnalysisSourceError,
+    read_analysis_artifact,
+)
 from .simulations import Manager, get_simulation_status
 
 logger = logging.getLogger(__name__)
@@ -37,16 +42,45 @@ async def create_analysis(
     if source["status"] != "completed":
         raise HTTPException(409, "Analysis requires a completed simulation")
     try:
+        archive = await asyncio.to_thread(manager.backend.get_task_archive, task_id)
+    except Exception:
+        logger.exception("Could not check archived analysis capacity")
+        raise HTTPException(503, "Analysis archive storage is unavailable") from None
+    if archive is not None and len(archive.get("analyses", [])) >= MAX_ARCHIVED_ANALYSES:
+        raise HTTPException(
+            429,
+            {
+                "code": "ANALYSIS_ARCHIVE_LIMIT_EXCEEDED",
+                "message": "This task has reached its archived analysis limit",
+            },
+        )
+    try:
         result = await analyses.create(source, bins=payload.bins, formats=tuple(payload.formats))
     except AnalysisCapacityError:
         raise HTTPException(
             429, "Analysis capacity is exhausted; retry later", headers={"Retry-After": "1"}
+        ) from None
+    except ArchiveCapacityError:
+        raise HTTPException(
+            429,
+            {
+                "code": "ANALYSIS_ARCHIVE_LIMIT_EXCEEDED",
+                "message": "This task has reached its archived analysis limit",
+            },
         ) from None
     except ResearchDependencyError as error:
         raise HTTPException(503, str(error)) from None
     except AnalysisSourceError:
         raise HTTPException(
             409, "Saved simulation artifacts failed integrity or model checks"
+        ) from None
+    except AnalysisArchiveError:
+        raise HTTPException(
+            503,
+            {
+                "code": "ANALYSIS_ARCHIVE_UNAVAILABLE",
+                "message": "Analysis archive write was not confirmed; inspect task provenance",
+            },
         ) from None
     except Exception:
         logger.exception("Could not generate velocity analysis for %s", task_id)

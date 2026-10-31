@@ -9,6 +9,7 @@ from threading import BoundedSemaphore
 from typing import Any
 
 from ..services.analysis_service import create_velocity_analysis
+from .task_store import TaskStore
 
 
 class AnalysisCapacityError(RuntimeError):
@@ -16,8 +17,11 @@ class AnalysisCapacityError(RuntimeError):
 
 
 class AnalysisManager:
-    def __init__(self, artifacts_dir: Path, workers: int = 2) -> None:
+    def __init__(
+        self, artifacts_dir: Path, workers: int = 2, *, provenance_store: TaskStore | None = None
+    ) -> None:
         self.artifacts_dir = artifacts_dir
+        self.provenance_store = provenance_store
         self._slots = BoundedSemaphore(workers)
         self._executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="AnalysisWorker"
@@ -36,6 +40,7 @@ class AnalysisManager:
             artifacts_dir=self.artifacts_dir,
             bins=bins,
             formats=formats,
+            provenance_store=self.provenance_store,
         )
 
         def execute() -> dict[str, Any]:

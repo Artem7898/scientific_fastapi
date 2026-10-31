@@ -170,6 +170,23 @@ The envelope links the result to the exact manifest bytes, artifact checksums an
 
 These checks establish consistency and integrity relative to saved metadata. They are not a digital signature, proof of authorship or independent physical-model validation. See the [API reference](docs/api_reference.md) for compatibility and verification limits.
 
+## History, provenance and RO-Crate
+
+New jobs record lifecycle history separately from bounded SSE replay. After `TASK_TTL_SECONDS` expires, existing polling and envelope URLs may become unavailable while archived provenance remains accessible:
+
+```bash
+curl http://localhost:8000/api/v1/tasks/TASK_ID/timeline
+curl http://localhost:8000/api/v1/provenance/tasks/TASK_ID
+curl http://localhost:8000/api/v1/provenance/tasks/TASK_ID/graph
+curl -o research-run.zip http://localhost:8000/api/v1/provenance/tasks/TASK_ID/export
+```
+
+The JSON-LD graph uses W3C PROV relations to link parameters, model, backend, RNG, the committed attempt, artifacts and recorded analyses. An artifact ID identifies its particular provenance; its content SHA256 is a separate value. Generic RO-Crate 1.1 export includes verified files and metadata for offline retention. It does not claim the Workflow Run profile, a results license or a DOI without supporting source metadata.
+
+Redis archive history has no TTL or SSE-style trimming. Restart durability requires retained Redis AOF/volumes and backups; the memory implementation retains history only until its process stops. The archive does not duplicate scientific files: retain the artifact volume too and define an operational retention policy for growing history. This is a record of observed lifecycle events, not a checkpoint or arbitrary-step restoration of physical state.
+
+Each source task permits up to `256` registered analyses. A new analysis beyond that limit receives `429 ANALYSIS_ARCHIVE_LIMIT_EXCEEDED` without `Retry-After`; additional analyses require a new source task.
+
 ## Optional dependencies
 
 The minimal installation runs the API and NumPy model. Install integrations explicitly:

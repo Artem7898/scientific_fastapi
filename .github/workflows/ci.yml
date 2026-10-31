@@ -95,10 +95,12 @@ jobs:
         run: |
           python - <<'PYTHON'
           import hashlib
+          import io
           import json
           import time
           import urllib.error
           import urllib.request
+          import zipfile
 
           base = "http://127.0.0.1:8000"
           with urllib.request.urlopen(base + "/api/v1/models", timeout=5) as response:
@@ -183,9 +185,41 @@ jobs:
           assert analysis_envelope["kind"] == "velocity_analysis"
           assert analysis_envelope["analysis_id"] == analysis["analysis_id"]
           assert analysis_envelope["integrity"]["status"] == "verified"
+          provenance_url = base + "/api/v1/provenance/tasks/" + result["task_id"]
+          with urllib.request.urlopen(provenance_url, timeout=5) as response:
+              provenance = json.load(response)
+          assert provenance["record"] == result
+          assert provenance["coverage"] == "complete" and provenance["storage"] == "redis"
+          assert provenance["evidence_status"] == "verified"
+          assert analysis["analysis_id"] in {item["analysis_id"] for item in provenance["analyses"]}
+          with urllib.request.urlopen(provenance_url + "/graph", timeout=5) as response:
+              graph = json.load(response)
+          assert graph["@context"] and graph["@graph"]
+          timeline_url = base + "/api/v1/tasks/" + result["task_id"] + "/timeline"
+          with urllib.request.urlopen(timeline_url + "?limit=2", timeout=5) as response:
+              page = json.load(response)
+          assert len(page["events"]) == 2 and page["has_more"]
+          with urllib.request.urlopen(timeline_url + "?after_id=" + page["next_cursor"], timeout=5) as response:
+              remaining = json.load(response)
+          assert {event["event_type"] for event in page["events"] + remaining["events"]} >= {
+              "submitted", "attempt_claimed", "completed", "analysis_completed",
+          }
+          record = provenance["artifacts"][0]
+          with urllib.request.urlopen(base + "/api/v1/provenance/artifacts/" + record["artifact_id"], timeout=5) as response:
+              assert json.load(response) == record
+          with urllib.request.urlopen(base + "/api/v1/provenance/analyses/" + analysis["analysis_id"], timeout=5) as response:
+              assert json.load(response)["evidence_status"] == "verified"
+          with urllib.request.urlopen(provenance_url + "/export", timeout=10) as response:
+              package = response.read()
+          archive_sha256 = hashlib.sha256(package).hexdigest()
+          with zipfile.ZipFile(io.BytesIO(package)) as archive:
+              assert {"ro-crate-metadata.json", "provenance.jsonld", "task.json", "model-contract.json"} <= set(archive.namelist())
+              assert json.loads(archive.read("task.json"))["record"] == result
+              for record in [*provenance["artifacts"], *provenance["analyses"][0]["artifacts"]]:
+                  assert hashlib.sha256(archive.read(record["path"])).hexdigest() == record["sha256"]
           with open("/tmp/container-task.json", "w") as stream:
-              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest, "analysis_id": analysis["analysis_id"]}, stream)
-          print("Container model catalog, task, analysis and verified envelopes passed")
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest, "analysis_id": analysis["analysis_id"], "archive_sha256": archive_sha256}, stream)
+          print("Container model catalog, envelopes, archived provenance, timeline and RO-Crate passed")
           PYTHON
       - name: Verify Langevin HTTP results and transport artifacts
         run: |
@@ -347,6 +381,14 @@ jobs:
               result = json.load(response)
           assert result["status"] == "completed"
           assert result["attempt_id"] == expected["attempt_id"]
+          provenance_url = "http://127.0.0.1:8000/api/v1/provenance/tasks/" + expected["task_id"]
+          with urllib.request.urlopen(provenance_url, timeout=5) as response:
+              provenance = json.load(response)
+          assert provenance["record"] == result
+          assert provenance["coverage"] == "complete"
+          assert expected["analysis_id"] in {item["analysis_id"] for item in provenance["analyses"]}
+          with urllib.request.urlopen(provenance_url + "/export", timeout=10) as response:
+              assert hashlib.sha256(response.read()).hexdigest() == expected["archive_sha256"]
           with urllib.request.urlopen(base + expected["task_id"] + "/envelope", timeout=5) as response:
               assert json.load(response)["integrity"]["status"] == "verified"
           analysis_path = base + expected["task_id"] + "/analyses/" + expected["analysis_id"] + "/envelope"
@@ -377,7 +419,7 @@ jobs:
           for name, digest in expected["hashes"].items():
               with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
                   assert hashlib.sha256(response.read()).hexdigest() == digest
-          print("OU/Langevin/LJ Redis state and artifact volumes survived restart")
+          print("OU/Langevin/LJ Redis state, archive, analysis lineage and RO-Crate survived restart")
           PYTHON
       - name: Verify separate worker, ensembles and SSE in the container stack
         run: |

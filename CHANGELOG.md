@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Archive lifecycle transitions and committed evidence atomically with queue state, with an untrimmed Redis journal independent of live-task TTL and a process-local memory equivalent.
+- Add archived provenance, paginated task timelines, W3C PROV JSON-LD graphs, stable artifact occurrence identifiers and saved-analysis links without inventing historical events or user identities.
+- Export bounded generic RO-Crate 1.1 ZIP packages from verified committed bytes; keep result licensing, signatures and scientific validation distinct from provenance integrity.
+- Exercise provenance beyond live-state expiry, offline exports and restart persistence without new core dependencies.
 - Add versioned model contracts and a JSON Schema catalog for the three scientific models, with explicit units, assumptions, invariants, diagnostics, backend semantics and artifact requirements.
 - Publish a typed Result Envelope after each new successful simulation and saved-velocity analysis; retain existing status responses and manifest outputs.
 - Verify manifest bytes, artifact checksums and contract bindings when reading envelopes; distinguish unavailable historical evidence from integrity conflicts without claiming authenticity or independent scientific validation.

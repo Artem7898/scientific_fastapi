@@ -16,6 +16,7 @@ from ..domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
 from ..domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from ..domain.simulation import SimulationCancelled
 from ..models.lj_forces import NeighborCapacityError, PairBudgetExceeded, ParticleOverlapError
+from ..services.provenance_evidence import build_archive_evidence
 from ..services.result_envelope_service import read_result_envelope
 from ..services.simulation_service import run_simulation
 from .config import Settings
@@ -111,8 +112,13 @@ class QueueManager:
             # Redis will recover the expired lease after reconnecting.
             logger.exception("Could not release interrupted task %s", job.task_id)
 
-    async def _finish(self, job: Job, result: dict[str, Any]) -> bool:
-        committed = await asyncio.to_thread(self.backend.finish, job, result)
+    async def _finish(
+        self, job: Job, result: dict[str, Any], *, evidence: dict[str, Any] | None = None
+    ) -> bool:
+        if evidence is None:
+            committed = await asyncio.to_thread(self.backend.finish, job, result)
+        else:
+            committed = await asyncio.to_thread(self.backend.finish, job, result, evidence=evidence)
         if committed:
             # A concurrent persisted cancellation can atomically replace the
             # requested outcome. Count the actual terminal state.
@@ -209,13 +215,15 @@ class QueueManager:
                 # Admission of a successful new result requires the exact
                 # manifest and artifacts verified after computation/tracking.
                 # The task store still fences this commit with the lease owner.
-                await asyncio.to_thread(
+                envelope = await asyncio.to_thread(
                     read_result_envelope,
                     result,
                     artifacts_dir=Path(self.settings.artifacts_dir),
                     require_present=True,
                 )
-                committed = await self._finish(job, result)
+                committed = await self._finish(
+                    job, result, evidence=build_archive_evidence(envelope)
+                )
                 if not committed:
                     logger.warning("Discarded result from an obsolete task lease")
         except SimulationCancelled:
