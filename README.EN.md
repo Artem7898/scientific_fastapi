@@ -202,6 +202,25 @@ Redis archive history has no TTL or SSE-style trimming. Restart durability requi
 
 Each source task permits up to `256` registered analyses. A new analysis beyond that limit receives `429 ANALYSIS_ARCHIVE_LIMIT_EXCEEDED` without `Retry-After`; additional analyses require a new source task.
 
+## Independent result verification
+
+Submit a completed calculation to a separate bounded verification queue:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/verifications \
+  -H 'Content-Type: application/json' -d '{"rerun":false}'
+curl http://localhost:8000/api/v1/verifications/VERIFICATION_ID
+curl -o certificate.json http://localhost:8000/api/v1/verifications/VERIFICATION_ID/certificate
+```
+
+The `202` response includes `verification_id` and `check_url`. A verifier binds source files to the archived committed result, checks integrity and independently recomputes supported observables/invariants. `{"rerun":true}` additionally requests a bounded same-seed repeat; this checks repeatability, rather than estimating statistical uncertainty anew.
+
+Job state and scientific verdict are separate: `completed` means verification finished; the verdict is `passed`, `failed`, `inconclusive` or `unsupported`. The source result, envelope, provenance graph and RO-Crate remain unchanged. `GET /api/v1/simulations/TASK_ID/verifications` lists verification records, including after the source task's live TTL expires.
+
+A certificate is unsigned JSON containing checks and limitations, with its SHA256 digest returned separately. Retrieval checks the certificate's own bytes; its findings describe source data at verification time and do not promise those files will remain unchanged. It is not proof of authorship or universal physical-model validity. Each source task permits up to `32` verifications; another POST creates another verification.
+
+`embedded` starts separate simulation and verification pools. For separate processes, run `python -m scientific_api.verification_worker` with shared Redis and artifact storage; a simulation worker does not consume that queue. See the [development guide](docs/development.md) for roles, budgets and deployment.
+
 ## Optional dependencies
 
 The minimal installation runs the API and NumPy model. Install integrations explicitly:
@@ -223,7 +242,7 @@ For example: `uv sync --frozen --extra redis --extra observability`. Redis, MLfl
 
 The default `EXECUTION_MODE=embedded` combines HTTP and computation with a bounded in-memory queue for local development in one process. Jobs and statuses are lost on restart, and independent processes do not share state. Enable `REDIS_URI` for shared state; acknowledgment, retries, and retention are described in the [architecture guide](docs/architecture.md).
 
-For separate execution, use `EXECUTION_MODE=api` for HTTP without simulation queue consumers and start independent processes with `EXECUTION_MODE=worker python -m scientific_api.worker`. Both roles require Redis and access to the same artifacts. API readiness checks its backend; it does not establish that a worker is running. Saved-state analysis still runs in the API's bounded pool. `WORKER_COUNT` is the consumer count per process, not a cluster-wide limit. Start the local Compose configuration with a separate worker using:
+For separate execution, use `EXECUTION_MODE=api` for HTTP without consumers of either queue. Run simulations with `python -m scientific_api.worker` and checks with `python -m scientific_api.verification_worker`. All separate roles require Redis and shared artifact access. API readiness checks storage, rather than remote consumer availability. Saved-state analysis still runs in the API's bounded pool. `WORKER_COUNT` and `VERIFICATION_WORKER_COUNT` control the respective consumers per process, not cluster-wide counts. Start the local Compose configuration with both worker services using:
 
 When upgrading an existing deployment, stop admission and all old embedded API/worker processes using the Redis namespace first: running the old and new protocols together is unsupported. The [upgrade procedure](docs/development.md) preserves Redis and artifact volumes. For a new or already stopped deployment:
 

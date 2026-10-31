@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an independent bounded leased verification queue and dedicated verification workers for archived completed results, without rewriting source results, envelopes or provenance exports.
+- Verify source integrity and independently recompute supported observables/invariants for the three models; allow an explicitly requested, resource-bounded same-seed rerun.
+- Publish durable unsigned canonical JSON certificates with checks, honest verdicts and integrity digests; distinguish job completion from scientific verification outcomes.
+- Separate simulation and verification worker roles, with explicit shared queue/rerun budgets and a verification-only Compose service; retain the lightweight dependency set.
 - Add optional bounded deterministic checkpoints for all three models, with PCG64 state, sampled prefixes, model caches and LJ work counters preserved across continuation.
 - Resume leased retries from the latest owner-fenced registered checkpoint; expose explicit integrity/compatibility failures instead of silently restarting incompatible state.
 - Add checkpoint discovery, verified downloads and bounded manual resume for failed/cancelled standalone tasks while preserving physical payloads, existing result responses and ensemble accounting.
