@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +19,7 @@ from .api.v1.endpoints.analyses import router as analysis_router
 from .api.v1.endpoints.checkpoints import router as checkpoint_router
 from .api.v1.endpoints.ensembles import router as ensemble_router
 from .api.v1.endpoints.events import router as event_router
+from .api.v1.endpoints.lj_research import router as research_router
 from .api.v1.endpoints.models import router as model_router
 from .api.v1.endpoints.provenance import router as provenance_router
 from .api.v1.endpoints.result_envelopes import router as envelope_router
@@ -27,6 +28,8 @@ from .api.v1.endpoints.verifications import router as verification_router
 from .core.analysis_manager import AnalysisManager
 from .core.config import Settings
 from .core.queue_manager import QueueManager
+from .core.research_manager import ResearchManager
+from .core.research_store import MemoryResearchStore, RedisResearchStore, ResearchStore
 from .core.task_store import MemoryTaskStore, RedisTaskStore, TaskStore
 from .core.telemetry import Telemetry
 from .core.verification_manager import VerificationManager
@@ -98,6 +101,7 @@ def create_app(
     backend: TaskStore | None = None,
     telemetry: Telemetry | None = None,
     verification_backend: VerificationStore | None = None,
+    research_backend: ResearchStore | None = None,
 ) -> FastAPI:
     """Construct an app; connections and workers exist only inside its lifespan."""
     configuration = settings if settings is not None else Settings()
@@ -110,6 +114,8 @@ def create_app(
         analyses: AnalysisManager | None = None
         verification_store: VerificationStore | None = None
         verifications: VerificationManager | None = None
+        research_store: ResearchStore | None = None
+        research: ResearchManager | None = None
         try:
             if backend is not None:
                 store = backend
@@ -183,34 +189,58 @@ def create_app(
                 verification_store, store, configuration, monitoring
             )
             application.state.verification_manager = verifications
+            research_options = {
+                "max_queue_size": configuration.max_research_queue_size,
+                "lease_seconds": configuration.task_lease_seconds,
+                "max_attempts": configuration.max_task_attempts,
+            }
+            research_store = (
+                research_backend
+                if research_backend is not None
+                else (
+                    RedisResearchStore(
+                        configuration.redis_uri,
+                        namespace=configuration.redis_namespace,
+                        **research_options,
+                    )
+                    if configuration.redis_uri
+                    and (backend is None or isinstance(backend, RedisTaskStore))
+                    else MemoryResearchStore(**research_options)
+                )
+            )
+            if not await asyncio.to_thread(research_store.health):
+                raise RuntimeError("Research backend did not pass its readiness check")
+            research = ResearchManager(research_store, store, configuration, monitoring)
+            application.state.research_manager = research
             if configuration.execution_mode in {"embedded", "worker"}:
                 await manager.start()
             if configuration.execution_mode in {"embedded", "verification-worker"}:
                 await verifications.start()
+            if configuration.execution_mode in {"embedded", "research-worker"}:
+                await research.start()
             yield
         finally:
-            try:
+            # Every callback is awaited even if another resource fails to stop.
+            # Register stores first: LIFO closes them only after their workers.
+            async with AsyncExitStack() as cleanup:
+                if store is not None:
+                    cleanup.push_async_callback(asyncio.to_thread, store.close)
+                if verification_store is not None:
+                    cleanup.push_async_callback(asyncio.to_thread, verification_store.close)
+                if research_store is not None:
+                    cleanup.push_async_callback(asyncio.to_thread, research_store.close)
+                if monitoring is not None:
+                    cleanup.push_async_callback(asyncio.to_thread, monitoring.shutdown)
+                if analyses is not None:
+                    cleanup.push_async_callback(
+                        analyses.stop, configuration.shutdown_timeout_seconds
+                    )
+                if manager is not None:
+                    cleanup.push_async_callback(manager.stop)
                 if verifications is not None:
-                    await verifications.stop()
-            finally:
-                try:
-                    if manager is not None:
-                        await manager.stop()
-                finally:
-                    try:
-                        if analyses is not None:
-                            await analyses.stop(configuration.shutdown_timeout_seconds)
-                    finally:
-                        try:
-                            if monitoring is not None:
-                                await asyncio.to_thread(monitoring.shutdown)
-                        finally:
-                            try:
-                                if verification_store is not None:
-                                    await asyncio.to_thread(verification_store.close)
-                            finally:
-                                if store is not None:
-                                    await asyncio.to_thread(store.close)
+                    cleanup.push_async_callback(verifications.stop)
+                if research is not None:
+                    cleanup.push_async_callback(research.stop)
 
     application = FastAPI(
         title=configuration.app_name,
@@ -230,6 +260,7 @@ def create_app(
     application.include_router(provenance_router, prefix="/api/v1")
     application.include_router(checkpoint_router, prefix="/api/v1")
     application.include_router(verification_router, prefix="/api/v1")
+    application.include_router(research_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -262,10 +293,19 @@ def create_app(
         try:
             healthy = await asyncio.to_thread(manager.backend.health)
             verification_healthy = await asyncio.to_thread(verifications.backend.health)
+            research = getattr(request.app.state, "research_manager", None)
+            if research is None or (
+                configuration.execution_mode in {"embedded", "research-worker"}
+                and not research.ready
+            ):
+                raise HTTPException(503, "Research workers are unavailable")
+            research_healthy = await asyncio.to_thread(research.backend.health)
+        except HTTPException:
+            raise
         except Exception:
             logger.exception("Task backend readiness check failed")
             raise HTTPException(503, "Task storage is unavailable") from None
-        if not healthy or not verification_healthy:
+        if not healthy or not verification_healthy or not research_healthy:
             raise HTTPException(503, "Task storage is unavailable")
         return {"status": "ready"}
 

@@ -66,3 +66,28 @@ services:
       - run_artifacts:/data/runs
     networks:
       - backend
+
+  research-worker:
+    build:
+      context: .
+      args:
+        INSTALL_NUMBA: ${INSTALL_NUMBA:-false}
+    command: ["python", "-m", "scientific_api.research_worker"]
+    restart: unless-stopped
+    stop_grace_period: 15s
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      EXECUTION_MODE: research-worker
+      REDIS_URI: redis://redis:6379/0
+      ARTIFACTS_DIR: /data/runs
+      RESEARCH_WORKER_COUNT: ${RESEARCH_WORKER_COUNT:-1}
+      MAX_RESEARCH_QUEUE_SIZE: ${MAX_RESEARCH_QUEUE_SIZE:-16}
+    # Queue admission and the worker process, rather than HTTP, expose readiness.
+    healthcheck:
+      disable: true
+    volumes:
+      - run_artifacts:/data/runs
+    networks:
+      - backend

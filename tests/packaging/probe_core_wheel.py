@@ -6,6 +6,7 @@ import importlib.metadata
 import importlib.util
 import io
 import json
+import logging
 import math
 import os
 import sys
@@ -24,6 +25,8 @@ def main() -> None:
 
     import scientific_api
     from scientific_api.core.config import Settings
+    from scientific_api.core.research_manager import ResearchManager
+    from scientific_api.core.research_store import MemoryResearchStore
     from scientific_api.core.task_store import MemoryTaskStore
     from scientific_api.core.telemetry import Telemetry
     from scientific_api.core.verification_manager import VerificationManager
@@ -42,8 +45,10 @@ def main() -> None:
     from scientific_api.models.lennard_jones_engine import create_lj_simulator
     from scientific_api.research.lj_analysis import analyze_lj_observables
     from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
+    from scientific_api.schemas.lj_research import LJResearchRequest
     from scientific_api.services.analysis_service import create_velocity_analysis
     from scientific_api.services.checkpoint_service import CheckpointControl, load_checkpoint
+    from scientific_api.services.lj_research_service import validate_lj_research_report
     from scientific_api.services.model_registry import (
         backend_availability,
         get_model_contract,
@@ -470,6 +475,94 @@ def main() -> None:
         )
         assert export_ro_crate(provenance, job.task_id)[0] == package
         verification_store.close()
+
+        research_source = "core_verify_lj"
+        source_before_research = store.get_task_archive(research_source)
+        assert source_before_research is not None
+        research_result = source_before_research["record"]
+        research_source_bytes = {
+            name: (root / path).read_bytes() for name, path in research_result["artifacts"].items()
+        }
+        research_crate = export_ro_crate(provenance, research_source)[0]
+        research_store = MemoryResearchStore(ttl_seconds=0.01)
+        research_manager = ResearchManager(
+            research_store,
+            store,
+            Settings(_env_file=None, artifacts_dir=root, redis_uri="", mlflow_tracking_uri=""),
+            telemetry,
+        )
+        research_request = LJResearchRequest(
+            task_ids=[research_source],
+            observables=["pressure"],
+            bootstrap_samples=200,
+            bootstrap_seed=2**64 - 1,
+        )
+
+        async def analyze_saved_lj() -> None:
+            await research_manager.start()
+            try:
+
+                async def finished(identifier: str) -> dict:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        record = research_manager.get(identifier)
+                        if record["status"] in {"completed", "failed", "cancelled"}:
+                            return record
+                        await asyncio.sleep(0.01)
+                    raise AssertionError("Core-only LJ research did not finish")
+
+                reports = []
+                accepted = []
+                for _ in range(2):
+                    item = await research_manager.submit(research_request)
+                    accepted.append(item)
+                    record = await finished(item["analysis_id"])
+                    assert record["status"] == "completed", record
+                    assert record["availability"] == "unavailable"
+                    raw, digest = research_manager.report(item["analysis_id"])
+                    assert hashlib.sha256(raw).hexdigest() == digest == record["report_sha256"]
+                    report = validate_lj_research_report(raw, expected_sha256=digest)
+                    assert report.options.bootstrap_seed == 2**64 - 1
+                    assert report.authenticity == "unsigned"
+                    assert report.source_integrity == "verified_against_committed_archive"
+                    assert report.sources[0].identity.task_id == research_source
+                    assert report.statistics["metrics"]["pressure"]["confidence_interval"] is None
+                    assert report.statistics["sampling"]["retained_sample_count"] < 128
+                    reports.append(report)
+                assert accepted[0]["analysis_id"] != accepted[1]["analysis_id"]
+                assert reports[0].statistics == reports[1].statistics
+                original_report = research_manager.report(accepted[0]["analysis_id"])
+                observed_path = root / research_result["artifacts"]["observables"]
+                expected_failure_log = logging.getLogger("scientific_api.core.research_manager")
+                previous_log_level = expected_failure_log.level
+                try:
+                    expected_failure_log.setLevel(logging.CRITICAL)
+                    observed_path.write_bytes(research_source_bytes["observables"] + b" ")
+                    bad = await research_manager.submit(research_request)
+                    bad_record = await finished(bad["analysis_id"])
+                    assert bad_record["status"] == "failed"
+                    assert bad_record["error_code"] == "RESEARCH_SOURCE_INTEGRITY_FAILED"
+                    assert research_manager.report(accepted[0]["analysis_id"]) == original_report
+                finally:
+                    expected_failure_log.setLevel(previous_log_level)
+                    observed_path.write_bytes(research_source_bytes["observables"])
+                assert len(research_manager.list(research_source)["analyses"]) == 3
+            finally:
+                await research_manager.stop()
+
+        asyncio.run(analyze_saved_lj())
+        assert store.get(research_source) is None
+        assert store.get_task_archive(research_source) == source_before_research
+        assert all(
+            (root / research_result["artifacts"][name]).read_bytes() == raw
+            for name, raw in research_source_bytes.items()
+        )
+        assert export_ro_crate(provenance, research_source)[0] == research_crate
+        assert (
+            read_result_envelope(research_result, artifacts_dir=root).uncertainty.availability
+            == "unavailable"
+        )
+        research_store.close()
         telemetry.shutdown()
         store.close()
 
@@ -502,9 +595,7 @@ def main() -> None:
     assert "scientific_api.models.numba_engine" not in sys.modules
     assert "scientific_api.models.langevin_numba" not in sys.modules
     assert "scientific_api.models.lj_numba" not in sys.modules
-    print(
-        "Core-only wheel: checkpoints, provenance, RO-Crate and independent verification certificates"
-    )
+    print("Core-only wheel: checkpoints, provenance, verification and immutable queued LJ research")
 
 
 if __name__ == "__main__":

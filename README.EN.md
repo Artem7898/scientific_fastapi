@@ -1,278 +1,207 @@
-# Scientific API Gateway
+# scientific_fastapi
 
-[Русский](README.md) · Python 3.12+ · [MIT](LICENSE)
+**Scientific API Gateway — reproducible physics experiments with inspectable results.**
 
-`scientific-api` is a scientific service example built with FastAPI: an independent NumPy computational core, strict contracts, background jobs, and persisted artifacts. Version 2.0.0 makes reproducibility and result validation part of the workflow.
+[![CI on main](https://github.com/Artem7898/scientific_fastapi/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Artem7898/scientific_fastapi/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![MIT license](https://img.shields.io/github/license/Artem7898/scientific_fastapi)](LICENSE)
+[![Latest GitHub release](https://img.shields.io/github/v/release/Artem7898/scientific_fastapi)](https://github.com/Artem7898/scientific_fastapi/releases/latest)
+[![GitHub release asset downloads](https://img.shields.io/github/downloads/Artem7898/scientific_fastapi/total)](https://github.com/Artem7898/scientific_fastapi/releases)
+[![AI-assisted development](https://img.shields.io/badge/Development-AI--assisted-64748B)](#development)
 
-The `ideal-gas-ou-v1` model describes two-dimensional velocities of independent particles coupled to an Ornstein–Uhlenbeck thermostat. It uses **dimensionless reduced units** with `m = k_B = 1` and friction `γ = 1`. This is an educational stochastic dynamics model; its inputs do not represent Kelvin or femtoseconds.
+**English** · [Русский: подробное руководство](README.RU.md) · [API reference (RU)](docs/api_reference.md) · [Architecture (RU)](docs/architecture.md)
 
-## Quick start
+Submit a seeded simulation, follow its progress, and retain the arrays, model contract, environment metadata and checksums behind the result. FastAPI handles HTTP; NumPy and optional Numba run the physics.
 
-Install Python 3.12+ and [uv](https://docs.astral.sh/uv/). In a cloud task, use the existing isolated checkout; an additional Git worktree is unnecessary.
+| You need | The project provides |
+| --- | --- |
+| Reproducible experiments | Explicit PCG64 seeds, versioned models, frozen dependencies and saved states |
+| Work beyond one HTTP request | Bounded queues, standalone workers, SSE, cancellation and opt-in checkpoints |
+| Inspectable evidence | Result Envelopes, archived provenance, RO-Crate export and independent verification |
+| Scientific comparisons | Ensembles, saved-data analysis and conditional LJ uncertainty workflows under review |
+
+> [!NOTE]
+> This README describes the current source tree. The published **v2.0.0** release predates several features below; its contract is documented in the [release notes](docs/releases/v2.0.0.md).
+
+## 🚀 Quick start
+
+For a fresh local deployment, install Git and a recent Docker Compose v2. No `.env` file or external Redis setup is required.
 
 ```bash
 git clone https://github.com/Artem7898/scientific_fastapi.git
 cd scientific_fastapi
+docker compose up --build --detach --wait api redis
+```
+
+Open **[Swagger UI](http://localhost:8000/docs)** or [ReDoc](http://localhost:8000/redoc). The API binds to `127.0.0.1:8000`; Redis and artifacts use named volumes. Initial image building downloads locked dependencies.
+
+Submit a small interacting-particle experiment:
+
+```bash
+curl -fsS http://localhost:8000/api/v1/simulations/lennard-jones \
+  -H 'Content-Type: application/json' \
+  -d '{"num_particles":16,"box_size":[8.0,8.0],"num_steps":40,"sample_stride":2,"seed":42}'
+```
+
+The **202** response supplies `task_id` and `check_url`. Poll `check_url` until terminal status; after `completed`, download the manifest and scientific state. All operations are also interactive in `/docs`.
+
+<details>
+<summary>Local Python installation and optional integrations</summary>
+
+Use Python **3.12+** and [uv **0.12.23**](https://docs.astral.sh/uv/), as pinned by the project. Distribution: `scientific-api`; import: `scientific_api`.
+
+```bash
 uv sync --frozen
-uv run --frozen uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
+uv run --frozen --no-sync uvicorn scientific_api.main:app --host 127.0.0.1 --port 8000
 ```
 
-OpenAPI is available at `http://localhost:8000/docs`, ReDoc at `/redoc`. Health endpoints are `/health/live` and `/health/ready`.
-
-Submit a job:
+This starts the NumPy core with process-local memory storage. Install extras explicitly: `redis`, `numba`, `tracking` (MLflow), `observability` (OpenTelemetry), `research` (Matplotlib PNG/PDF), `notebooks`, `benchmark`, `dev`.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/simulations/monte-carlo \
-  -H 'Content-Type: application/json' \
-  -d '{"initial_temperature":300.0,"num_particles":1000,"time_step":0.001,"num_steps":100,"seed":42}'
+uv sync --frozen --extra redis --extra numba --extra observability
 ```
 
-The service responds with `202 Accepted`:
+Memory queues are for one process; Redis and shared artifact storage support separate processes. See the [configuration and upgrade guide](docs/development.md).
 
-```json
-{
-  "task_id": "a1b2c3d4",
-  "status": "pending",
-  "check_url": "/api/v1/simulations/status/a1b2c3d4"
-}
+</details>
+
+## 🧪 Models and applications
+
+| Model | What it calculates | Useful for |
+| --- | --- | --- |
+| `ideal-gas-ou-v1` | Exact 2D OU velocity transitions, kinetic temperature and energy | Teaching stochastic dynamics and checking analytic estimators |
+| `langevin-free-v1` | Positions, constant acceleration, drift, MSD and gated diffusion estimates | Transport-method experiments with independent particles |
+| `lennard-jones-2d-v1` | Periodic 2D LJ; NVE velocity Verlet or NVT BAOAB; energies, pressure and RDF | Testing interacting-particle algorithms and finite numerical experiments |
+
+Models use **reduced units** with $k_B=1$. Material properties require an explicit physical calibration. LJ initialization has fixed kinetic temperature and zero center-of-mass motion; equilibration is a separate scientific question.
+
+<details>
+<summary>One analytic reference and its scope</summary>
+
+For the independent equilibrium snapshot in `ideal-gas-ou-v1`,
+
+$$
+\operatorname{SE}(\widehat T)=\frac{T}{\sqrt N}.
+$$
+
+This formula describes that model's terminal temperature estimator. Interacting LJ particles and consecutive frames require their own correlation-aware analysis. Read the [scientific assumptions and limitations](docs/architecture.md).
+
+</details>
+
+## Architecture
+
+```mermaid
+flowchart LR
+    accTitle: Scientific API execution and evidence
+    accDescr: HTTP submits jobs to bounded queues. Separate simulation, verification and research workers use saved artifacts and retain their own results.
+    Client["HTTP / OpenAPI clients"] --> API["FastAPI · strict contracts"]
+    API --> Queues["Memory locally / Redis queues"]
+    Queues --> Sim["Simulation · NumPy / Numba"]
+    Queues --> Verify["Verification workers"]
+    Queues --> Research["LJ research workers"]
+    Sim --> Files["NPZ + manifests + envelopes"]
+    Files --> Verify
+    Files --> Research
+    Verify --> Reports["Immutable certificates / reports"]
+    Research --> Reports
+    Queues --> Provenance["Archive · PROV graph · RO-Crate"]
+    API -.-> Telemetry["Optional OpenTelemetry"]
+    Sim -.-> Tracking["Optional MLflow"]
 ```
 
-Poll `check_url`. The same `task_id` passes through `pending`, `running`, and `completed` or `failed`/`cancelled`. A completed response includes temperature, energy, temperature standard error, model version, seed, and artifact references. See the [API reference](docs/api_reference.md) for the complete contract and limits.
+The API validates requests; workers own numerical execution. Simulation files, lifecycle provenance and later verification/research outputs remain distinct. Redis coordinates deliveries; multiple machines also need shared artifact storage. [Implementation boundaries](docs/architecture.md) keep the numerical core independent of HTTP and tracking.
 
-## Positions, an external field and diffusion
+For separate processes, use [compose.worker.yml](compose.worker.yml): `api`, simulation `worker`, `verification-worker` and `research-worker`. The default `embedded` mode runs the consumers locally. Saved-velocity PNG/PDF generation uses a bounded API-process pool.
 
-The separate `langevin-free-v1` model adds positions and constant external acceleration. Initial temperature, bath temperature, mass and relaxation rate are specified independently; the original `ideal-gas-ou-v1` model is retained.
+## Evidence and research workflows
 
-```bash
-curl -X POST http://localhost:8000/api/v1/simulations/langevin \
-  -H 'Content-Type: application/json' \
-  -d '{"initial_temperature":1.0,"bath_temperature":1.0,"num_particles":1000,"time_step":0.02,"num_steps":1000,"seed":42,"acceleration":[0.1,0.0],"sample_stride":10,"diffusion_fit_start_step":500,"diffusion_fit_end_step":1000}'
-```
+Routes below are relative to `/api/v1`; replace the IDs with returned values.
 
-The `202` response contains the same `check_url`; SSE, cancellation, standalone workers and ensembles also support this model. Download four artifacts after `completed`:
-
-```bash
-curl -o manifest.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/manifest
-curl -o final_state.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/final_state
-curl -o trajectory.npz http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/trajectory
-curl -o transport.json http://localhost:8000/api/v1/simulations/TASK_ID/artifacts/transport
-```
-
-`transport.json` contains mean displacement, MSD, centered MSD and a diffusion estimate. Centering separates mean drift from fluctuations. The fit needs at least three saved points after initial transients have decayed and checks its theoretical finite-window bias. Short runs explicitly report an unavailable estimate. The standard error uses a delete-one-particle jackknife, retaining temporal correlations within each independent particle trajectory.
-
-Space is unbounded by default. Add `"boundary":"periodic","box_size":[5.0,5.0]` for a periodic domain. Terminal `positions` lie inside the box, while the trajectory stores continuous unwrapped coordinates, so boundary crossings do not create artificial MSD saturation. Frame count and memory are bounded. See the [development guide](docs/development.md#координаты-поля-и-анализ-переноса) for assumptions and saved-trajectory reanalysis.
-
-## Interacting particles: Lennard–Jones
-
-`lennard-jones-2d-v1` adds a two-dimensional periodic Lennard–Jones system. Choose NVE with velocity Verlet, or NVT with BAOAB and an explicit bath temperature:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/simulations/lennard-jones \
-  -H 'Content-Type: application/json' \
-  -d '{"num_particles":64,"box_size":[12.0,12.0],"initial_temperature":1.0,"ensemble":"nve","time_step":0.002,"num_steps":1000,"sample_stride":10,"seed":42,"interaction_backend":"verlet"}'
-```
-
-For NVT, set `"ensemble":"nvt","bath_temperature":1.0,"friction":1.0`. The shifted-force cutoff makes both potential and force continuous at the cutoff. `interaction_backend="direct"` is the reference pair calculation; `"verlet"` uses a cell-built neighbor list, rebuilt when any unwrapped displacement reaches half the skin. The separate `backend` field selects NumPy or optional Numba.
-
-After completion, download `manifest`, `final_state`, `trajectory` and `observables` through the task's existing artifact URLs. `observables.json` contains energy/temperature/pressure series, energy diagnostics and a finite-size-normalized 2D radial distribution. Potential energy, total energy and pressure may be negative. Initial velocities have zero center-of-mass motion and a fixed kinetic temperature; this is not a canonical equilibrium draw. NVT needs equilibration, and correlated frames do not provide independent standard errors.
-
-The timestep is bounded relative to `sigma*sqrt(mass/epsilon)` and the work, pair checks and trajectory sizes have explicit limits. Units remain reduced with `k_B=1`; this model does not establish a real substance's properties. See the [LJ workflow and benchmark](docs/development.md#леннард--джонс-взаимодействующие-частицы) for setup, validation and measured costs.
-
-## Optional Numba execution
-
-NumPy remains the default and reference implementation. To use the CPU Numba backend, install its extra in the API environment and every worker consuming the same queue:
-
-```bash
-uv sync --frozen --extra numba
-uv run --no-sync uvicorn scientific_api.main:app --host 0.0.0.0 --port 8000
-```
-
-Include `"backend":"numba"` in the simulation request. For an ensemble, put the same field inside `parameters`; every replica uses that backend. Keep any other required extras in the `uv sync` command. Missing Numba produces `503` before admission; unknown backend names, including `jax`, produce `422`. Execution never silently switches to NumPy.
-
-Both implementations use float64 state and local NumPy PCG64 randomness. Stochastic models generate noise one step at a time; NVE only draws initial velocities. Numba compiles CPU kernels with `fastmath=False` and no internal parallel pool. OU workflows calculate terminal observables; LJ also records its requested observable samples. Cancellation checks and progress updates retain step boundaries. The first Numba calculation in each process includes import and compilation costs; compilation is not cached on disk. The run manifest records the actual backend, implementation and kernel versions, dtype, device, and RNG policy in `execution`.
-
-Choose a backend using the [runtime benchmark](docs/development.md#benchmark) on the target machine. JAX remains an optional benchmark experiment; GPU execution is not an API backend. A GPU speedup requires a verified device and measurements that include data transfer and synchronization.
-
-## Analyze a saved simulation
-
-After `status="completed"` for `ideal-gas-ou-v1`, analyze the saved velocities without running another simulation. `langevin-free-v1` uses `transport.json`; the interacting LJ model uses `observables.json`. Their physical/statistical contracts differ from the equilibrium-only velocity report. JSON analysis works with the minimal installation:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/analyses \
-  -H 'Content-Type: application/json' \
-  -d '{"bins":32,"formats":[]}'
-```
-
-The request waits for generation in a bounded thread pool and returns **201 Created** with `analysis_id`, the committed `attempt_id`, and `artifacts.analysis` and `artifacts.manifest` URLs. For PNG and PDF, install `uv sync --frozen --extra research`, then request `{"bins":32,"formats":["png","pdf"]}`. The response adds `artifacts.png` and `artifacts.pdf`; open these URLs in a browser or download them:
-
-```bash
-curl -o analysis.json http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/analysis
-curl -o velocity_distribution.png http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/png
-curl -o report.pdf http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/artifacts/pdf
-```
-
-In `/docs`, select **Scientific Analysis → POST /api/v1/simulations/{task_id}/analyses → Try it out**, enter a completed task ID and request body, then click **Execute**. The PNG has three panels for `v_x`, `v_y`, and speed against the 2D Gaussian/Rayleigh reference; the PDF adds context and limitations. Moment and visual agreement do not prove correctness or equilibration: the current model already starts in its equilibrium distribution.
-
-Two simultaneous analyses are allowed per API process by default; a busy service returns `429` with `Retry-After: 1`. This phase waits for completion over HTTP and has no persistent analysis queue. A disconnected request leaves its thread running and occupying capacity until completion; the client may lose its result URLs, and retrying POST creates a new analysis. See the [API reference](docs/api_reference.md) for source integrity checks, availability limits, and formats.
-
-## Progress and cancellation
-
-Server-Sent Events expose task progress. Existing polling through `check_url` continues to work:
-
-```bash
-curl -N http://localhost:8000/api/v1/simulations/TASK_ID/events
-curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/cancel
-```
-
-Cancellation returns `202` to acknowledge the request; check the eventual state through polling or SSE. Event history is bounded. On reconnect, send the last received `id` in `Last-Event-ID`; if replay history is unavailable, the stream reports a reset and the current state. Progress belongs to an attempt. Checkpoints are disabled by default and retries restart from the seed; when enabled, workers continue from the latest registered compatible checkpoint.
-
-## Checkpoints and continuation
-
-Set `CHECKPOINT_INTERVAL_STEPS`, for example `100`, in the embedded process or every worker sharing the queue. Its default `0` disables saving. State is published atomically after a completed step and sample: positions/velocities, PCG64 state, integrator and accumulated samples, plus LJ forces, neighbor lists and work counters. The cadence may increase to stay within `32` registered checkpoints and `512 MiB` per task.
-
-```bash
-curl http://localhost:8000/api/v1/simulations/TASK_ID/checkpoints
-curl http://localhost:8000/api/v1/simulations/TASK_ID/checkpoints/CHECKPOINT_ID
-curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/resume \
-  -H 'Content-Type: application/json' -d '{}'
-```
-
-Lease recovery uses only registered checkpoints. Manual resume accepts failed/cancelled standalone tasks, retaining the task ID, parameters and seed while creating a new attempt. Completed tasks and ensemble children cannot be reopened manually. Repeating the same active resume returns `202`; each task permits up to `32` manual resumptions.
-
-Corrupt or incompatible state never silently restarts from the seed: failures use `CHECKPOINT_INTEGRITY_FAILED` or `REPRODUCIBILITY_CONFLICT`. Repeatability covers scientific arrays, samples and observables in a supported environment, not UUIDs, timestamps or the bytes of ZIP files/manifests. See the [API reference](docs/api_reference.md) for downloads and compatibility limits.
-
-## Ensembles of independent replicas
-
-`POST /api/v1/ensembles` accepts one model and its parameters without `seed`, a replica count from `1..50`, and `base_seed`. For example:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/ensembles \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: temperature-study-001' \
-  -d '{"model":"ideal-gas-ou-v1","parameters":{"initial_temperature":300.0,"num_particles":1000,"num_steps":100},"replicas":4,"base_seed":42,"failure_policy":"require_all"}'
-```
-
-The `202` response includes `ensemble_id` and `check_url`. Read status through `GET /api/v1/ensembles/ENSEMBLE_ID`, request cancellation of remaining work through `POST /api/v1/ensembles/ENSEMBLE_ID/cancel`, and download `/api/v1/ensembles/ENSEMBLE_ID/manifest` after completion. These operations appear under **Ensembles** in `/docs`.
-
-All seeds are saved before execution, and admission reserves capacity for every replica atomically. The total budget counts `replicas * num_particles * num_steps`; existing workers execute the jobs. An optional `Idempotency-Key` returns the same ensemble on retry; conflicting parameters produce `409`. With `require_all`, failures and cancellations remain explicit and no survivor-only aggregate is reported. Sample SD (`ddof=1`) and the mean's SE require all replicas to succeed and `M >= 2`; both are `null` for one replica. These estimates across independent replicas differ from the single-snapshot theoretical error `T/sqrt(N)`.
-
-For transport studies, set `"model":"langevin-free-v1"` and put the new endpoint's parameters without `seed` inside `parameters`. Ensemble statistics follow the selected model; kinetic energy from drift is kept separate from thermal temperature.
-
-For interacting particles, set `"model":"lennard-jones-2d-v1"`. Replicas aggregate thermal temperature, kinetic/potential/total energy and pressure. The independent-OU theoretical temperature error is unavailable for this model; between-replica SD/SE still requires independent seeds and at least two successful replicas.
-
-## Reproducibility
-
-- Each calculation uses a local `numpy.random.Generator` with an explicit seed and PCG64 algorithm; the request specifies the number of steps.
-- The API saves a run manifest and `final_state.npz` in `ARTIFACTS_DIR/<task_id>/<attempt_id>/`. `task_id` stays stable; `attempt_id` distinguishes execution attempts during queue recovery. The result references the committed attempt. The manifest records inputs, model, results, environment versions, and the commit when available.
-- `uv.lock` fixes resolved dependencies; `uv sync --frozen` installs without regenerating the lockfile. A `pylock.toml` export supports tools implementing PEP 751.
-- Tests check repeatability in a fixed environment, analytical properties of the model, the API contract, and research artifact generation.
-
-A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of `ideal-gas-ou-v1`. Free Langevin distinguishes thermal-temperature uncertainty, diffusion estimation and between-replica statistics. LJ uses its interacting-model observables and independent-replica summaries; correlated frames are not independent observations. These estimates do not include physical model error or measurement uncertainty.
-
-## Model contracts and Result Envelope
-
-`GET /api/v1/models` lists the three supported models; `GET /api/v1/models/MODEL_VERSION` returns one model's contract. Contracts describe input/result JSON Schemas, reduced units, scientific assumptions, invariants, diagnostics, required artifacts and NumPy/Numba semantics. Optional-backend availability is reported separately for the API process; it does not establish remote worker readiness.
-
-Every new successful calculation publishes `envelope.json` after its manifest. Existing status responses and `manifest.outputs` stay unchanged. Read the result envelope through the separate endpoints:
-
-```bash
-curl http://localhost:8000/api/v1/models
-curl http://localhost:8000/api/v1/simulations/TASK_ID/envelope
-curl http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/envelope
-```
-
-The envelope links the result to the exact manifest bytes, artifact checksums and model contract. Each read verifies the saved files again. A mismatch produces `409`; a run without a recorded envelope declaration is explicitly `not_verified` when its envelope is absent. Unavailable uncertainty includes a reason: correlated LJ frames are not treated as independent observations.
-
-These checks establish consistency and integrity relative to saved metadata. They are not a digital signature, proof of authorship or independent physical-model validation. See the [API reference](docs/api_reference.md) for compatibility and verification limits.
-
-## History, provenance and RO-Crate
-
-New jobs record lifecycle history separately from bounded SSE replay. After `TASK_TTL_SECONDS` expires, existing polling and envelope URLs may become unavailable while archived provenance remains accessible:
-
-```bash
-curl http://localhost:8000/api/v1/tasks/TASK_ID/timeline
-curl http://localhost:8000/api/v1/provenance/tasks/TASK_ID
-curl http://localhost:8000/api/v1/provenance/tasks/TASK_ID/graph
-curl -o research-run.zip http://localhost:8000/api/v1/provenance/tasks/TASK_ID/export
-```
-
-The JSON-LD graph uses W3C PROV relations to link parameters, model, backend, RNG, the committed attempt, artifacts and recorded analyses. An artifact ID identifies its particular provenance; its content SHA256 is a separate value. Generic RO-Crate 1.1 export includes verified files and metadata for offline retention. It does not claim the Workflow Run profile, a results license or a DOI without supporting source metadata.
-
-Redis archive history has no TTL or SSE-style trimming. Restart durability requires retained Redis AOF/volumes and backups; the memory implementation retains history only until its process stops. The archive does not duplicate scientific files: retain the artifact volume too and define an operational retention policy for growing history. This is a record of observed lifecycle events, not a checkpoint or arbitrary-step restoration of physical state.
-
-Each source task permits up to `256` registered analyses. A new analysis beyond that limit receives `429 ANALYSIS_ARCHIVE_LIMIT_EXCEEDED` without `Retry-After`; additional analyses require a new source task.
-
-## Independent result verification
-
-Submit a completed calculation to a separate bounded verification queue:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/verifications \
-  -H 'Content-Type: application/json' -d '{"rerun":false}'
-curl http://localhost:8000/api/v1/verifications/VERIFICATION_ID
-curl -o certificate.json http://localhost:8000/api/v1/verifications/VERIFICATION_ID/certificate
-```
-
-The `202` response includes `verification_id` and `check_url`. A verifier binds source files to the archived committed result, checks integrity and independently recomputes supported observables/invariants. `{"rerun":true}` additionally requests a bounded same-seed repeat; this checks repeatability, rather than estimating statistical uncertainty anew.
-
-Job state and scientific verdict are separate: `completed` means verification finished; the verdict is `passed`, `failed`, `inconclusive` or `unsupported`. The source result, envelope, provenance graph and RO-Crate remain unchanged. `GET /api/v1/simulations/TASK_ID/verifications` lists verification records, including after the source task's live TTL expires.
-
-A certificate is unsigned JSON containing checks and limitations, with its SHA256 digest returned separately. Retrieval checks the certificate's own bytes; its findings describe source data at verification time and do not promise those files will remain unchanged. It is not proof of authorship or universal physical-model validity. Each source task permits up to `32` verifications; another POST creates another verification.
-
-`embedded` starts separate simulation and verification pools. For separate processes, run `python -m scientific_api.verification_worker` with shared Redis and artifact storage; a simulation worker does not consume that queue. See the [development guide](docs/development.md) for roles, budgets and deployment.
-
-## Optional dependencies
-
-The minimal installation runs the API and NumPy model. Install integrations explicitly:
-
-| Extra | Purpose |
+| Purpose | Endpoint |
 | --- | --- |
-| `dev` | pytest, Ruff, Pyright, package validation tools |
-| `redis` | Redis status storage and queue |
-| `tracking` | MLflow adapter |
-| `research` | saved-velocity PNG/PDF reports and research figures |
-| `notebooks` | Jupyter and notebook tooling |
-| `observability` | OpenTelemetry and telemetry export |
-| `numba` | optional Numba CPU execution for simulations and ensembles |
-| `benchmark` | additional computational backends for comparisons |
+| Inspect model contracts | `GET /models` |
+| Follow progress / request cancellation | `GET /simulations/{id}/events` · `POST /simulations/{id}/cancel` |
+| Recheck saved result integrity | `GET /simulations/{id}/envelope` |
+| Inspect lineage / retain files offline | `GET /provenance/tasks/{id}/graph` · `GET /provenance/tasks/{id}/export` |
+| Continue a compatible interrupted run | `POST /simulations/{id}/resume` |
+| Independently verify a result | `POST /simulations/{id}/verifications` |
+| Analyze saved LJ data — development branch | `POST /research/lj/analyses` |
 
-For example: `uv sync --frozen --extra redis --extra observability`. Redis, MLflow, and OpenTelemetry adapters load when their integration is enabled. An empty `MLFLOW_TRACKING_URI` disables tracking.
+Checkpoints are opt-in through `CHECKPOINT_INTERVAL_STEPS`; compatibility conflicts are explicit. Verification has a separate queue and unsigned certificate: `completed` is job state, while `passed`, `failed`, `inconclusive` and `unsupported` are scientific-check verdicts. A checksum establishes agreement with recorded bytes; it does not establish authorship or experimental validity.
 
-## Execution and telemetry
+The LJ research work in this branch uses conditional **batch-means Student-t intervals** for time series; moving-block-bootstrap summaries are explicitly exploratory. It also compares whole replicas and matched-seed parameter groups. Intervals require adequate data and stated assumptions; a completed analysis can report an unavailable interval with a reason. See the [calibration report](docs/validation/lj-uncertainty.md) for measured scope and the [API reference](docs/api_reference.md) for diagnostics and budgets.
 
-The default `EXECUTION_MODE=embedded` combines HTTP and computation with a bounded in-memory queue for local development in one process. Jobs and statuses are lost on restart, and independent processes do not share state. Enable `REDIS_URI` for shared state; acknowledgment, retries, and retention are described in the [architecture guide](docs/architecture.md).
+## ⚡ Measured performance and resource use
 
-For separate execution, use `EXECUTION_MODE=api` for HTTP without consumers of either queue. Run simulations with `python -m scientific_api.worker` and checks with `python -m scientific_api.verification_worker`. All separate roles require Redis and shared artifact access. API readiness checks storage, rather than remote consumer availability. Saved-state analysis still runs in the API's bounded pool. `WORKER_COUNT` and `VERIFICATION_WORKER_COUNT` control the respective consumers per process, not cluster-wide counts. Start the local Compose configuration with both worker services using:
+One **1024-particle × 20-step** LJ benchmark on AMD EPYC 9V74, using five warm samples:
 
-When upgrading an existing deployment, stop admission and all old embedded API/worker processes using the Redis namespace first: running the old and new protocols together is unsupported. The [upgrade procedure](docs/development.md) preserves Redis and artifact volumes. For a new or already stopped deployment:
+| NumPy direct | NumPy cell-Verlet | Numba direct | Numba cell-Verlet |
+| ---: | ---: | ---: | ---: |
+| 1,218.096 ms | 40.006 ms | 41.925 ms | 21.209 ms |
+
+These are engine medians including initialization and neighbor construction, excluding HTTP, queueing, RDF and artifact I/O. Density, cutoff, workload and compilation costs matter. The [raw measurements and scope](docs/benchmarks/lj/README.md) and [full-service CPU benchmarks](docs/benchmarks/README.md) explain the tradeoffs.
+
+LJ admission bounds include **4096 particles**, **20 million particle-steps**, **1001 saved frames** and **64 MiB of trajectory coordinates**; additional physics/pair-work limits apply. These are admission limits, not latency guarantees.
+
+Resource-conscious execution uses bounded particle-step/pair-work budgets, sampled trajectories, cooperative cancellation and reanalysis of saved data. Energy/carbon measurements are future work. Production backends are CPU NumPy/Numba. JAX is a benchmark-only CPU experiment; GPU execution and free-threaded Python require targeted validation.
+
+## Operations, security and observability
+
+- **Integrity and admission:** strict finite inputs, explicit backend selection, bounded queues, owner-fenced commits, atomic artifacts and bounded no-pickle NPZ readers.
+- **Container defaults:** pinned base images, an unprivileged runtime user and loopback host ports. Retain both Redis and artifact volumes when upgrading.
+- **Observability:** opt-in OpenTelemetry traces HTTP/queues/computation; metrics cover HTTP and simulation wait/run/outcomes. Logs use standard Python/Uvicorn handlers; configure JSON formatting in deployment. MLflow tracking is optional.
+
+Public deployment requires your gateway's authentication, TLS, user quotas and network/storage policy. [Operational configuration](docs/development.md) documents execution roles, retention and exporters.
+
+[![Coverage: not published](https://img.shields.io/badge/coverage-not%20published-lightgrey)](.github/workflows/ci.yml)
+[![Security score: not published](https://img.shields.io/badge/security%20score-not%20published-lightgrey)](.github/workflows/ci.yml)
+[![OpenSSF: not integrated](https://img.shields.io/badge/OpenSSF-not%20integrated-lightgrey)](.github/workflows/ci.yml)
+
+| Quality signal | Published evidence |
+| --- | --- |
+| CI | Python 3.12–3.14, numerical references, Redis recovery, wheel and Docker checks |
+| Test coverage | No coverage percentage is produced by the repository CI |
+| Security / OpenSSF | No vulnerability-scan report or Scorecard workflow is committed; no score is claimed |
+
+## Roadmap · 2026–2027
+
+| Area | Status |
+| --- | --- |
+| Scientific core, reports, workers, ensembles, NumPy/Numba, transport and LJ | Implemented in the source history |
+| Contracts, provenance, checkpoints and independent verification | Implemented; stages 1–9 merged into `main` |
+| Conditional LJ uncertainty and sensitivity — stage 10 | Implemented in this branch; conditional intervals with scoped calibration |
+| Authenticated users/agents, per-principal quotas, signed attestations and MCP | Proposed next infrastructure work |
+| Slurm, GPU execution or browser/Wasm experiments | Exploratory; require a concrete deployment need and measured validation |
+
+Stage 10 completes the agreed ten-stage scientific plan. The proposed items above are future directions, not additional agreed stages.
+
+<a id="development"></a>
+
+## Development and contributing
+
+Use an issue to describe a bug, experiment or proposed scientific contract; keep pull requests focused and include validation for numerical changes.
+
+- Version changes to model/RNG semantics and add reference or regression checks.
+- Change dependencies and `uv.lock` only within an explicit dependency-update scope.
+- Preserve committed source artifacts; publish derived analyses as separate records.
+- Run the checks below, including real Redis tests for queue or recovery changes.
 
 ```bash
-docker compose -f docker-compose.yml -f compose.worker.yml up --build
+uv sync --frozen --extra dev --extra redis --extra tracking --extra research --extra observability --extra numba
+uv run --frozen --no-sync ruff check .
+uv run --frozen --no-sync ruff format --check .
+uv run --frozen --no-sync pyright
+uv run --frozen --no-sync pytest
 ```
 
-Use one Uvicorn worker with the in-memory queue. Multiple machines also need shared artifact storage: Redis does not share local files.
+A disposable Redis URI in `SCIENTIFIC_TEST_REDIS_URI` enables the persistent-queue tests. See [development](docs/development.md), [benchmarks](docs/benchmarks/README.md) and the [changelog](CHANGELOG.md).
 
-After installing `observability`, set `OTEL_ENABLED=true` to connect HTTP requests, queue waiting, and calculations in traces. Metrics describe queue waiting, execution duration, and errors. Exporter configuration is covered in the [development guide](docs/development.md).
+AI-assisted changes are produced under maintainer direction and must meet the same review and validation requirements as other contributions. Cursor, Windsurf, Claude and other assistants can use the repository and its OpenAPI contract as development inputs. Compatibility here means working from documented files and HTTP contracts; the runtime uses the declared Python dependencies. Documented diagram text and meaningful links support reading without relying on color or animation.
 
-## Development
+## License, citation and contact
 
-```bash
-uv sync --frozen --extra dev --extra research --extra redis --extra observability --extra numba
-uv run --no-sync ruff check .
-uv run --no-sync ruff format --check .
-uv run --no-sync pyright src/
-uv run --no-sync pytest
-```
+Code is [MIT licensed](LICENSE), © 2026 Artem Alimpiev. Research-output licensing follows its own metadata. Cite the project through [CITATION.cff](CITATION.cff) and GitHub's **Cite this repository** action.
 
-CI installs from the lockfile and checks code, reproducibility, and the built package. The [development guide](docs/development.md) covers research artifacts, benchmarking, builds, and PEP 751 export. Benchmarks use a fixed workload and report warmup separately. Measure process, Numba, JAX, and free-threaded Python performance on the target machine before claiming a speedup.
+[Artem Alimpiev](https://github.com/Artem7898) · [ORCID](https://orcid.org/0009-0007-6740-7242) · [Issues](https://github.com/Artem7898/scientific_fastapi/issues) · [Email](mailto:alimpievne@gmail.com).
 
-## Documentation and citation
-
-- [Architecture and limitations](docs/architecture.md)
-- [API reference](docs/api_reference.md)
-- [Development, artifacts, and benchmarks](docs/development.md)
-- [Citation metadata](CITATION.cff)
-
-Author: Artem Alimpiev · [ORCID](https://orcid.org/0009-0007-6740-7242) · [Zenodo](https://doi.org/10.5281/zenodo.20057106).
-
-Licensed under [MIT](LICENSE).
+Built with [FastAPI](https://fastapi.tiangolo.com/), [NumPy](https://numpy.org/), [Numba](https://numba.pydata.org/), [uv](https://docs.astral.sh/uv/) and [Redis](https://redis.io/), with optional [OpenTelemetry](https://opentelemetry.io/), [MLflow](https://mlflow.org/) and [Matplotlib](https://matplotlib.org/).
