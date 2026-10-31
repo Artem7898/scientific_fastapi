@@ -232,9 +232,40 @@ jobs:
               assert json.loads(archive.read("task.json"))["record"] == result
               for record in [*provenance["artifacts"], *provenance["analyses"][0]["artifacts"]]:
                   assert hashlib.sha256(archive.read(record["path"])).hexdigest() == record["sha256"]
+          verification_url = base + "/api/v1/simulations/" + result["task_id"] + "/verifications"
+          request = urllib.request.Request(
+              verification_url, data=b'{"rerun":false}', headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              verification = json.load(response)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              with urllib.request.urlopen(base + verification["check_url"], timeout=5) as response:
+                  verification_record = json.load(response)
+              if verification_record["status"] == "completed":
+                  break
+              assert verification_record["status"] in {"pending", "running"}, verification_record
+              time.sleep(0.05)
+          else:
+              raise AssertionError("Embedded verification did not finish")
+          assert verification_record["verdict"] == "passed", verification_record
+          with urllib.request.urlopen(base + verification["check_url"] + "/certificate", timeout=5) as response:
+              certificate = response.read()
+              verification_sha256 = hashlib.sha256(certificate).hexdigest()
+              assert verification_sha256 == response.headers["X-Content-SHA256"]
+          assert verification_sha256 == verification_record["certificate_sha256"]
+          certificate_record = json.loads(certificate)
+          assert certificate_record["source"]["task_id"] == result["task_id"]
+          assert certificate_record["source"]["attempt_id"] == result["attempt_id"]
+          assert certificate_record["authenticity"] == "unsigned"
+          with urllib.request.urlopen(verification_url, timeout=5) as response:
+              assert verification["verification_id"] in {item["verification_id"] for item in json.load(response)["verifications"]}
+          with urllib.request.urlopen(provenance_url + "/export", timeout=10) as response:
+              assert hashlib.sha256(response.read()).hexdigest() == archive_sha256
           with open("/tmp/container-task.json", "w") as stream:
-              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest, "analysis_id": analysis["analysis_id"], "archive_sha256": archive_sha256}, stream)
-          print("Container model catalog, envelopes, archived provenance, timeline and RO-Crate passed")
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest, "analysis_id": analysis["analysis_id"], "archive_sha256": archive_sha256, "verification_id": verification["verification_id"], "verification_sha256": verification_sha256}, stream)
+          print("Container contracts, provenance, unchanged RO-Crate and independent certificate passed")
           PYTHON
       - name: Verify Langevin HTTP results and transport artifacts
         run: |
@@ -404,6 +435,12 @@ jobs:
           assert expected["analysis_id"] in {item["analysis_id"] for item in provenance["analyses"]}
           with urllib.request.urlopen(provenance_url + "/export", timeout=10) as response:
               assert hashlib.sha256(response.read()).hexdigest() == expected["archive_sha256"]
+          verification_url = "http://127.0.0.1:8000/api/v1/verifications/" + expected["verification_id"]
+          with urllib.request.urlopen(verification_url, timeout=5) as response:
+              record = json.load(response)
+          assert record["status"] == "completed" and record["verdict"] == "passed"
+          with urllib.request.urlopen(verification_url + "/certificate", timeout=5) as response:
+              assert hashlib.sha256(response.read()).hexdigest() == expected["verification_sha256"]
           with urllib.request.urlopen(base + expected["task_id"] + "/envelope", timeout=5) as response:
               assert json.load(response)["integrity"]["status"] == "verified"
           analysis_path = base + expected["task_id"] + "/analyses/" + expected["analysis_id"] + "/envelope"
@@ -436,9 +473,12 @@ jobs:
                   assert hashlib.sha256(response.read()).hexdigest() == digest
           print("OU/Langevin/LJ Redis state, archive, analysis lineage and RO-Crate survived restart")
           PYTHON
-      - name: Verify separate worker, ensembles and SSE in the container stack
+      - name: Verify separate simulation and verification workers, ensembles and SSE
         run: |
           docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach --wait --wait-timeout 180 api redis
+          # The verifier serves no HTTP and intentionally disables the image's
+          # HTTP healthcheck; the queued verification below checks its readiness.
+          docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach verification-worker
           python - <<'PYTHON'
           import json
           import subprocess
@@ -466,6 +506,28 @@ jobs:
               assert response.status == 202
               accepted = json.load(response)
           time.sleep(0.2)
+          assert read(accepted["check_url"])["counts"]["pending"] == 3
+          with open("/tmp/container-task.json") as stream:
+              source = json.load(stream)
+          request = urllib.request.Request(
+              base + "/api/v1/simulations/" + source["task_id"] + "/verifications",
+              data=b'{"rerun":true}', headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=5) as response:
+              assert response.status == 202
+              verification = json.load(response)
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              record = read(verification["check_url"])
+              if record["status"] == "completed":
+                  break
+              assert record["status"] in {"pending", "running"}, record
+              time.sleep(0.05)
+          else:
+              raise AssertionError("The standalone verifier did not finish")
+          assert record["verdict"] == "passed", record
+          assert read(verification["check_url"] + "/certificate")["options"]["rerun"] is True
+          # A verification-only process must leave simulation deliveries pending.
           assert read(accepted["check_url"])["counts"]["pending"] == 3
           subprocess.run([*compose, "up", "--build", "--detach", "worker"], check=True)
           deadline = time.monotonic() + 30
@@ -498,7 +560,7 @@ jobs:
               replay = response.read().decode()
           assert '"status":"completed"' in replay
           assert not any(line == "id: " + first_id for line in replay.splitlines())
-          print("Separate worker, ensemble provenance, uint64 seeds and SSE replay passed")
+          print("Separate simulation/verifier queues, bounded rerun, ensembles and SSE replay passed")
           PYTHON
       - name: Show container logs after failure
         if: failure()

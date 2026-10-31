@@ -23,11 +23,18 @@ from .api.v1.endpoints.models import router as model_router
 from .api.v1.endpoints.provenance import router as provenance_router
 from .api.v1.endpoints.result_envelopes import router as envelope_router
 from .api.v1.endpoints.simulations import router as sim_router
+from .api.v1.endpoints.verifications import router as verification_router
 from .core.analysis_manager import AnalysisManager
 from .core.config import Settings
 from .core.queue_manager import QueueManager
 from .core.task_store import MemoryTaskStore, RedisTaskStore, TaskStore
 from .core.telemetry import Telemetry
+from .core.verification_manager import VerificationManager
+from .core.verification_store import (
+    MemoryVerificationStore,
+    RedisVerificationStore,
+    VerificationStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +97,7 @@ def create_app(
     *,
     backend: TaskStore | None = None,
     telemetry: Telemetry | None = None,
+    verification_backend: VerificationStore | None = None,
 ) -> FastAPI:
     """Construct an app; connections and workers exist only inside its lifespan."""
     configuration = settings if settings is not None else Settings()
@@ -100,6 +108,8 @@ def create_app(
         manager: QueueManager | None = None
         monitoring: Telemetry | None = None
         analyses: AnalysisManager | None = None
+        verification_store: VerificationStore | None = None
+        verifications: VerificationManager | None = None
         try:
             if backend is not None:
                 store = backend
@@ -122,7 +132,9 @@ def create_app(
             configuration.artifacts_dir.mkdir(parents=True, exist_ok=True)
             tracker = await asyncio.to_thread(
                 build_tracker,
-                configuration.mlflow_tracking_uri if configuration.execution_mode != "api" else "",
+                configuration.mlflow_tracking_uri
+                if configuration.execution_mode in {"embedded", "worker"}
+                else "",
                 configuration.mlflow_experiment_name,
             )
             monitoring = (
@@ -146,24 +158,59 @@ def create_app(
                 provenance_store=store,
             )
             application.state.analysis_manager = analyses
+            verification_options = {
+                "max_queue_size": configuration.max_verification_queue_size,
+                "lease_seconds": configuration.task_lease_seconds,
+                "max_attempts": configuration.max_task_attempts,
+            }
+            verification_store = (
+                verification_backend
+                if verification_backend is not None
+                else (
+                    RedisVerificationStore(
+                        configuration.redis_uri,
+                        namespace=configuration.redis_namespace,
+                        **verification_options,
+                    )
+                    if configuration.redis_uri
+                    and (backend is None or isinstance(backend, RedisTaskStore))
+                    else MemoryVerificationStore(**verification_options)
+                )
+            )
+            if not await asyncio.to_thread(verification_store.health):
+                raise RuntimeError("Verification backend did not pass its readiness check")
+            verifications = VerificationManager(
+                verification_store, store, configuration, monitoring
+            )
+            application.state.verification_manager = verifications
             if configuration.execution_mode in {"embedded", "worker"}:
                 await manager.start()
+            if configuration.execution_mode in {"embedded", "verification-worker"}:
+                await verifications.start()
             yield
         finally:
             try:
-                if manager is not None:
-                    await manager.stop()
+                if verifications is not None:
+                    await verifications.stop()
             finally:
                 try:
-                    if analyses is not None:
-                        await analyses.stop(configuration.shutdown_timeout_seconds)
+                    if manager is not None:
+                        await manager.stop()
                 finally:
                     try:
-                        if monitoring is not None:
-                            await asyncio.to_thread(monitoring.shutdown)
+                        if analyses is not None:
+                            await analyses.stop(configuration.shutdown_timeout_seconds)
                     finally:
-                        if store is not None:
-                            await asyncio.to_thread(store.close)
+                        try:
+                            if monitoring is not None:
+                                await asyncio.to_thread(monitoring.shutdown)
+                        finally:
+                            try:
+                                if verification_store is not None:
+                                    await asyncio.to_thread(verification_store.close)
+                            finally:
+                                if store is not None:
+                                    await asyncio.to_thread(store.close)
 
     application = FastAPI(
         title=configuration.app_name,
@@ -182,6 +229,7 @@ def create_app(
     application.include_router(envelope_router, prefix="/api/v1")
     application.include_router(provenance_router, prefix="/api/v1")
     application.include_router(checkpoint_router, prefix="/api/v1")
+    application.include_router(verification_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -203,14 +251,21 @@ def create_app(
         manager = getattr(request.app.state, "queue_manager", None)
         if manager is None:
             raise HTTPException(503, "Task resources are unavailable")
-        if configuration.execution_mode != "api" and not manager.ready:
+        if configuration.execution_mode in {"embedded", "worker"} and not manager.ready:
             raise HTTPException(503, "Simulation workers are unavailable")
+        verifications = getattr(request.app.state, "verification_manager", None)
+        if verifications is None or (
+            configuration.execution_mode in {"embedded", "verification-worker"}
+            and not verifications.ready
+        ):
+            raise HTTPException(503, "Verification workers are unavailable")
         try:
             healthy = await asyncio.to_thread(manager.backend.health)
+            verification_healthy = await asyncio.to_thread(verifications.backend.health)
         except Exception:
             logger.exception("Task backend readiness check failed")
             raise HTTPException(503, "Task storage is unavailable") from None
-        if not healthy:
+        if not healthy or not verification_healthy:
             raise HTTPException(503, "Task storage is unavailable")
         return {"status": "ready"}
 

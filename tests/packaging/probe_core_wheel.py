@@ -1,5 +1,6 @@
 """Run with an isolated Python and a core-only installed wheel outside checkout."""
 
+import asyncio
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -21,7 +23,12 @@ def main() -> None:
     import numpy as np
 
     import scientific_api
+    from scientific_api.core.config import Settings
     from scientific_api.core.task_store import MemoryTaskStore
+    from scientific_api.core.telemetry import Telemetry
+    from scientific_api.core.verification_manager import VerificationManager
+    from scientific_api.core.verification_store import MemoryVerificationStore
+    from scientific_api.domain.checkpoint import checkpoint_model_version
     from scientific_api.domain.langevin import LangevinParameters
     from scientific_api.domain.lennard_jones import LennardJonesParameters
     from scientific_api.domain.simulation import SimulationParameters
@@ -48,6 +55,7 @@ def main() -> None:
     from scientific_api.services.provenance_service import ProvenanceService
     from scientific_api.services.result_envelope_service import read_result_envelope
     from scientific_api.services.simulation_service import run_simulation
+    from scientific_api.services.verification_service import validate_verification_certificate
 
     expected = os.environ["EXPECTED_PACKAGE_VERSION"]
     assert scientific_api.__version__ == expected
@@ -371,6 +379,98 @@ def main() -> None:
             ).integrity.status
             == "verified"
         )
+        verification_sources = [(job.task_id, False), (job.task_id, True)]
+        for identifier, physical in (
+            (
+                "core_verify_langevin",
+                LangevinParameters(
+                    1.0, 1.0, 4, num_steps=4, time_step=0.1, sample_stride=2, seed=42
+                ),
+            ),
+            ("core_verify_lj", parameters),
+        ):
+            store.submit(
+                identifier, {"model": checkpoint_model_version(physical), **asdict(physical)}, {}
+            )
+            source_job = store.claim()
+            assert source_job is not None and source_job.task_id == identifier
+            source_result = run_simulation(
+                physical, task_id=identifier, attempt_id=source_job.owner, artifacts_dir=root
+            )
+            source_envelope = read_result_envelope(
+                source_result, artifacts_dir=root, require_present=True
+            )
+            assert store.finish(
+                source_job, source_result, evidence=build_archive_evidence(source_envelope)
+            )
+            verification_sources.append((identifier, False))
+        time.sleep(0.02)
+        assert all(store.get(identifier) is None for identifier, _ in verification_sources)
+        source_archive = store.get_task_archive(job.task_id)
+        source_bytes = {
+            name: (root / path).read_bytes() for name, path in archived_result["artifacts"].items()
+        }
+        verification_store = MemoryVerificationStore(ttl_seconds=0.01)
+        telemetry = Telemetry(enabled=False)
+        verification_manager = VerificationManager(
+            verification_store,
+            store,
+            Settings(_env_file=None, artifacts_dir=root, redis_uri="", mlflow_tracking_uri=""),
+            telemetry,
+        )
+
+        async def verify_archived_sources() -> None:
+            await verification_manager.start()
+            try:
+                accepted = [
+                    await verification_manager.submit(identifier, rerun=rerun)
+                    for identifier, rerun in verification_sources
+                ]
+
+                async def completed(identifier: str) -> dict:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        record = verification_manager.get(identifier)
+                        if record["status"] == "completed":
+                            return record
+                        assert record["status"] in {"pending", "running"}, record
+                        await asyncio.sleep(0.01)
+                    raise AssertionError("Core-only verification did not complete")
+
+                for item in accepted:
+                    record = await completed(item["verification_id"])
+                    assert record["verdict"] == "passed", record
+                    raw, digest = verification_manager.certificate(item["verification_id"])
+                    assert hashlib.sha256(raw).hexdigest() == digest == record["certificate_sha256"]
+                    certificate = validate_verification_certificate(raw, expected_sha256=digest)
+                    assert certificate.authenticity == "unsigned"
+                    assert certificate.scope == "recorded_artifacts_at_verification_time"
+                    assert certificate.source.task_id == item["source_task_id"]
+                    assert certificate.source.attempt_id == item["source_attempt_id"]
+                    assert certificate.checks and certificate.limitations
+                original_id = accepted[0]["verification_id"]
+                original_certificate = verification_manager.certificate(original_id)
+                state_path = root / archived_result["artifacts"]["final_state"]
+                try:
+                    state_path.write_bytes(source_bytes["final_state"] + b"corrupted")
+                    bad = await verification_manager.submit(job.task_id)
+                    assert (await completed(bad["verification_id"]))["verdict"] == "failed"
+                    assert verification_manager.certificate(original_id) == original_certificate
+                finally:
+                    state_path.write_bytes(source_bytes["final_state"])
+                assert len(verification_manager.list(job.task_id)["verifications"]) == 3
+            finally:
+                await verification_manager.stop()
+
+        asyncio.run(verify_archived_sources())
+        assert store.get_task_archive(job.task_id) == source_archive
+        assert all(
+            (root / archived_result["artifacts"][name]).read_bytes() == raw
+            for name, raw in source_bytes.items()
+        )
+        assert export_ro_crate(provenance, job.task_id)[0] == package
+        verification_store.close()
+        telemetry.shutdown()
         store.close()
 
     for operation in (
@@ -403,7 +503,7 @@ def main() -> None:
     assert "scientific_api.models.langevin_numba" not in sys.modules
     assert "scientific_api.models.lj_numba" not in sys.modules
     print(
-        "Core-only wheel: models, exact checkpoint continuation, envelopes, provenance and RO-Crate"
+        "Core-only wheel: checkpoints, provenance, RO-Crate and independent verification certificates"
     )
 
 
