@@ -18,6 +18,8 @@ from .adapters.mlflow_adapter import build_tracker
 from .api.v1.endpoints.analyses import router as analysis_router
 from .api.v1.endpoints.ensembles import router as ensemble_router
 from .api.v1.endpoints.events import router as event_router
+from .api.v1.endpoints.models import router as model_router
+from .api.v1.endpoints.result_envelopes import router as envelope_router
 from .api.v1.endpoints.simulations import router as sim_router
 from .core.analysis_manager import AnalysisManager
 from .core.config import Settings
@@ -172,6 +174,8 @@ def create_app(
     application.include_router(analysis_router, prefix="/api/v1")
     application.include_router(ensemble_router, prefix="/api/v1")
     application.include_router(event_router, prefix="/api/v1")
+    application.include_router(model_router, prefix="/api/v1")
+    application.include_router(envelope_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:

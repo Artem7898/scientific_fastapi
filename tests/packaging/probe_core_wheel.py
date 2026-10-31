@@ -31,12 +31,51 @@ def main() -> None:
     from scientific_api.models.lennard_jones_engine import create_lj_simulator
     from scientific_api.research.lj_analysis import analyze_lj_observables
     from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
+    from scientific_api.services.analysis_service import create_velocity_analysis
+    from scientific_api.services.model_registry import (
+        backend_availability,
+        get_model_contract,
+        list_model_contracts,
+        model_contract_sha256,
+    )
+    from scientific_api.services.result_envelope_service import read_result_envelope
     from scientific_api.services.simulation_service import run_simulation
 
     expected = os.environ["EXPECTED_PACKAGE_VERSION"]
     assert scientific_api.__version__ == expected
     assert importlib.metadata.version("scientific-api") == expected
     assert app is not None
+
+    contracts = list_model_contracts()
+    assert {contract.model_version for contract in contracts} == {
+        "ideal-gas-ou-v1",
+        "langevin-free-v1",
+        "lennard-jones-2d-v1",
+    }
+    for contract in contracts:
+        assert contract.request_schema["additionalProperties"] is False
+        assert contract.result_schema["additionalProperties"] is False
+        assert contract.default_backend == "numpy"
+        assert {backend.backend for backend in contract.backends} == {"numpy", "numba"}
+    availability = {entry.backend: entry for entry in backend_availability()}
+    assert availability["numpy"].dependency_present is True
+    assert availability["numba"].dependency_present is False
+    assert all(entry.worker_readiness == "not_checked" for entry in availability.values())
+
+    def verify_envelope(result: dict, root: Path) -> None:
+        envelope = read_result_envelope(result, artifacts_dir=root, require_present=True)
+        assert envelope.integrity.status == "verified"
+        assert envelope.authenticity == "unsigned"
+        assert envelope.scientific_verification == "not_performed"
+        assert envelope.result.model_dump(mode="json") == result
+        assert envelope.model_contract is not None
+        contract = get_model_contract(result["model_version"])
+        assert envelope.model_contract.sha256 == model_contract_sha256(contract)
+        assert envelope.manifest is not None
+        assert (
+            envelope.manifest.sha256
+            == hashlib.sha256((root / result["artifacts"]["manifest"]).read_bytes()).hexdigest()
+        )
 
     require_backend("numpy")
     simulator = create_simulator(SimulationParameters(initial_temperature=1.0, num_particles=4))
@@ -46,6 +85,20 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        ou_result = run_simulation(
+            SimulationParameters(initial_temperature=1.0, num_particles=8, num_steps=3),
+            task_id="core_ou",
+            attempt_id="wheel",
+            artifacts_dir=root,
+        )
+        verify_envelope(ou_result, root)
+        analysis = create_velocity_analysis(ou_result, artifacts_dir=root, bins=4, formats=())
+        analysis_envelope = read_result_envelope(
+            ou_result, artifacts_dir=root, analysis_id=analysis["analysis_id"], require_present=True
+        )
+        assert analysis_envelope.kind == "velocity_analysis"
+        assert analysis_envelope.integrity.status == "verified"
+        assert analysis_envelope.result.model_dump(mode="json") == analysis
         parameters = LangevinParameters(
             1.0, 1.0, 4, num_steps=4, time_step=0.1, sample_stride=2, seed=42
         )
@@ -54,6 +107,7 @@ def main() -> None:
         )
         assert result["status"] == "completed"
         assert result["model_version"] == "langevin-free-v1"
+        verify_envelope(result, root)
         assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
         manifest = json.loads((root / result["artifacts"]["manifest"]).read_text())
         assert manifest["model"]["version"] == "langevin-free-v1"
@@ -100,6 +154,7 @@ def main() -> None:
         )
         assert result["status"] == "completed"
         assert result["model_version"] == "lennard-jones-2d-v1"
+        verify_envelope(result, root)
         assert result["potential_energy"] < 0 and result["total_energy"] < 0
         assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
         manifest = json.loads((root / result["artifacts"]["manifest"]).read_text())
@@ -162,7 +217,9 @@ def main() -> None:
     assert "scientific_api.models.numba_engine" not in sys.modules
     assert "scientific_api.models.langevin_numba" not in sys.modules
     assert "scientific_api.models.lj_numba" not in sys.modules
-    print("Core-only wheel: OU/Langevin/LJ run and reanalyze; optional libraries stay absent")
+    print(
+        "Core-only wheel: model catalog, OU/Langevin/LJ envelopes and analysis; extras stay absent"
+    )
 
 
 if __name__ == "__main__":

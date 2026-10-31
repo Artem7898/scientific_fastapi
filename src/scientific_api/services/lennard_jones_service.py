@@ -161,6 +161,10 @@ def run_lj_simulation(
         }
         manifest = {
             "schema_version": 1,
+            "result_envelope": {
+                "schema_version": 1,
+                "path": (run_dir / "envelope.json").relative_to(root).as_posix(),
+            },
             "task_id": task_id,
             "attempt_id": attempt_id,
             "created_at": datetime.now(UTC).isoformat(),
@@ -257,6 +261,10 @@ def run_lj_simulation(
         json.dumps(result, allow_nan=False)
         _check_cancelled(cancel_event)
         _write_manifest(run_dir / "manifest.json", manifest)
+        from .result_envelope_service import publish_result_envelope
+
+        publish_result_envelope(result, artifacts_dir=root)
+        _check_cancelled(cancel_event)
         log_artifact = getattr(tracker, "log_artifact", None)
         if callable(log_artifact):
             for path in (state_path, trajectory_path, analysis_path, run_dir / "manifest.json"):

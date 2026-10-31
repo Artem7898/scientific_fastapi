@@ -101,6 +101,16 @@ jobs:
           import urllib.request
 
           base = "http://127.0.0.1:8000"
+          with urllib.request.urlopen(base + "/api/v1/models", timeout=5) as response:
+              catalog = json.load(response)
+          assert {model["model_version"] for model in catalog["models"]} == {
+              "ideal-gas-ou-v1", "langevin-free-v1", "lennard-jones-2d-v1",
+          }
+          assert all(model["default_backend"] == "numpy" for model in catalog["models"])
+          available = {entry["backend"]: entry for entry in catalog["backend_availability"]}
+          assert available["numpy"]["dependency_present"] is True
+          assert available["numba"]["dependency_present"] is False
+          assert all(entry["worker_readiness"] == "not_checked" for entry in available.values())
           invalid = urllib.request.Request(
               base + "/api/v1/simulations/monte-carlo",
               data=b'{"initial_temperature":300.0,"num_particles":24,"time_step":1e309}',
@@ -150,9 +160,32 @@ jobs:
           with urllib.request.urlopen(artifact + "final_state", timeout=5) as response:
               digest = hashlib.sha256(response.read()).hexdigest()
           assert digest == manifest["artifacts"][0]["sha256"]
+          evidence_url = base + "/api/v1/simulations/" + result["task_id"] + "/envelope"
+          with urllib.request.urlopen(evidence_url, timeout=5) as response:
+              assert response.headers["Cache-Control"] == "no-store"
+              envelope = json.load(response)
+          assert envelope["result"] == result
+          assert envelope["integrity"]["status"] == "verified"
+          assert envelope["authenticity"] == "unsigned"
+          assert envelope["scientific_verification"] == "not_performed"
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              assert envelope["manifest"]["sha256"] == hashlib.sha256(response.read()).hexdigest()
+          analysis_url = base + "/api/v1/simulations/" + result["task_id"] + "/analyses"
+          request = urllib.request.Request(
+              analysis_url, data=b'{"bins":4,"formats":[]}',
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=10) as response:
+              assert response.status == 201
+              analysis = json.load(response)
+          with urllib.request.urlopen(analysis_url + "/" + analysis["analysis_id"] + "/envelope", timeout=5) as response:
+              analysis_envelope = json.load(response)
+          assert analysis_envelope["kind"] == "velocity_analysis"
+          assert analysis_envelope["analysis_id"] == analysis["analysis_id"]
+          assert analysis_envelope["integrity"]["status"] == "verified"
           with open("/tmp/container-task.json", "w") as stream:
-              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest}, stream)
-          print("Container validation, task, attempt isolation and artifact hash passed")
+              json.dump({"task_id": result["task_id"], "attempt_id": result["attempt_id"], "sha256": digest, "analysis_id": analysis["analysis_id"]}, stream)
+          print("Container model catalog, task, analysis and verified envelopes passed")
           PYTHON
       - name: Verify Langevin HTTP results and transport artifacts
         run: |
@@ -212,6 +245,12 @@ jobs:
           assert transport["msd"][-1] == result["final_msd"]
           assert transport["centered_msd"][-1] == result["final_centered_msd"]
           assert transport["sample_steps"] == list(range(0, 101, 10))
+          with urllib.request.urlopen(base + "/api/v1/simulations/" + result["task_id"] + "/envelope", timeout=5) as response:
+              envelope = json.load(response)
+          assert envelope["result"] == result
+          assert envelope["integrity"]["status"] == "verified"
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              assert envelope["manifest"]["sha256"] == hashlib.sha256(response.read()).hexdigest()
           with zipfile.ZipFile(io.BytesIO(artifacts["trajectory"])) as archive:
               assert set(archive.namelist()) == {"positions.npy", "sample_steps.npy", "times.npy"}
           with open("/tmp/container-langevin-task.json", "w") as stream:
@@ -278,6 +317,14 @@ jobs:
           assert observed["rdf"]["dimensions"] == 2
           assert observed["energy_drift"]["applicable"] is True
           assert observed["sample_steps"] == list(range(7))
+          with urllib.request.urlopen(base + "/api/v1/simulations/" + result["task_id"] + "/envelope", timeout=5) as response:
+              envelope = json.load(response)
+          assert envelope["result"] == result
+          assert envelope["integrity"]["status"] == "verified"
+          assert envelope["uncertainty"]["availability"] == "unavailable"
+          assert envelope["uncertainty"]["reason"]
+          with urllib.request.urlopen(artifact + "manifest", timeout=5) as response:
+              assert envelope["manifest"]["sha256"] == hashlib.sha256(response.read()).hexdigest()
           with zipfile.ZipFile(io.BytesIO(artifacts["trajectory"])) as archive:
               assert set(archive.namelist()) == {"positions.npy", "sample_steps.npy", "times.npy"}
           with open("/tmp/container-lj-task.json", "w") as stream:
@@ -300,6 +347,11 @@ jobs:
               result = json.load(response)
           assert result["status"] == "completed"
           assert result["attempt_id"] == expected["attempt_id"]
+          with urllib.request.urlopen(base + expected["task_id"] + "/envelope", timeout=5) as response:
+              assert json.load(response)["integrity"]["status"] == "verified"
+          analysis_path = base + expected["task_id"] + "/analyses/" + expected["analysis_id"] + "/envelope"
+          with urllib.request.urlopen(analysis_path, timeout=5) as response:
+              assert json.load(response)["integrity"]["status"] == "verified"
           with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/final_state", timeout=5) as response:
               assert hashlib.sha256(response.read()).hexdigest() == expected["sha256"]
           with open("/tmp/container-langevin-task.json") as stream:
@@ -308,6 +360,8 @@ jobs:
               result = json.load(response)
           assert result["status"] == "completed" and result["model_version"] == "langevin-free-v1"
           assert result["attempt_id"] == expected["attempt_id"]
+          with urllib.request.urlopen(base + expected["task_id"] + "/envelope", timeout=5) as response:
+              assert json.load(response)["integrity"]["status"] == "verified"
           for name, digest in expected["hashes"].items():
               with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
                   assert hashlib.sha256(response.read()).hexdigest() == digest
@@ -317,6 +371,8 @@ jobs:
               result = json.load(response)
           assert result["status"] == "completed" and result["model_version"] == "lennard-jones-2d-v1"
           assert result["attempt_id"] == expected["attempt_id"]
+          with urllib.request.urlopen(base + expected["task_id"] + "/envelope", timeout=5) as response:
+              assert json.load(response)["integrity"]["status"] == "verified"
           assert result["potential_energy"] < 0 and result["total_energy"] < 0
           for name, digest in expected["hashes"].items():
               with urllib.request.urlopen(base + expected["task_id"] + "/artifacts/" + name, timeout=5) as response:
@@ -419,6 +475,7 @@ jobs:
           from scientific_api.domain.simulation import SimulationParameters
           from scientific_api.research.lj_analysis import analyze_lj_observables
           from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
+          from scientific_api.services.result_envelope_service import read_result_envelope
           from scientific_api.services.simulation_service import run_simulation
 
           assert importlib.util.find_spec("jax") is None
@@ -426,6 +483,17 @@ jobs:
           assert not os.access(Path(scientific_api.__file__).parent, os.W_OK)
           states = {}
           manifests = {}
+
+          def verify_envelope(result, root):
+              envelope = read_result_envelope(result, artifacts_dir=root, require_present=True)
+              assert envelope.integrity.status == "verified"
+              assert envelope.result.model_dump(mode="json") == result
+              assert envelope.authenticity == "unsigned"
+              assert envelope.scientific_verification == "not_performed"
+              assert envelope.manifest.sha256 == hashlib.sha256(
+                  (root / result["artifacts"]["manifest"]).read_bytes()
+              ).hexdigest()
+
           with tempfile.TemporaryDirectory() as directory:
               root = Path(directory)
               for backend in ("numpy", "numba"):
@@ -438,6 +506,7 @@ jobs:
                       attempt_id="runtime", artifacts_dir=root,
                   )
                   assert result["status"] == "completed"
+                  verify_envelope(result, root)
                   state_path = root / result["artifacts"]["final_state"]
                   with np.load(state_path, allow_pickle=False) as state:
                       states[backend] = state["velocities"].copy()
@@ -462,6 +531,7 @@ jobs:
                       attempt_id="runtime", artifacts_dir=root,
                   )
                   assert result["status"] == "completed" and result["model_version"] == "langevin-free-v1"
+                  verify_envelope(result, root)
                   assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
                   with (root / result["artifacts"]["manifest"]).open() as stream:
                       manifest = json.load(stream)
@@ -523,6 +593,7 @@ jobs:
                       parameters, task_id="lj_" + variant, attempt_id="runtime", artifacts_dir=root,
                   )
                   assert result["status"] == "completed" and result["model_version"] == "lennard-jones-2d-v1"
+                  verify_envelope(result, root)
                   assert result["potential_energy"] < 0 and result["total_energy"] < 0
                   assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
                   with (root / result["artifacts"]["manifest"]).open() as stream:
@@ -582,7 +653,7 @@ jobs:
               assert execution["fastmath"] is False and execution["parallel"] is False
               assert execution["cache"] is False and execution["nogil"] is True
           assert not any(name.split(".", 1)[0] in {"jax", "jaxlib"} for name in sys.modules)
-          print("Optional Numba image executes OU/Langevin/LJ and reanalyzes saved CPU results")
+          print("Optional Numba image executes OU/Langevin/LJ, verifies envelopes and reanalyzes CPU results")
           PYTHON
 
   optional-benchmarks:

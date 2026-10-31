@@ -223,6 +223,10 @@ def create_velocity_analysis(
         }
         manifest = {
             "schema_version": 1,
+            "result_envelope": {
+                "schema_version": 1,
+                "path": f"{prefix}/{analysis_id}/envelope.json",
+            },
             "analysis_id": analysis_id,
             "analysis_version": analysis["analysis_version"],
             "report_version": REPORT_VERSION if formats else None,
@@ -237,7 +241,7 @@ def create_velocity_analysis(
         if destination.exists():
             raise FileExistsError("Analysis already exists")
         os.rename(temporary, destination)
-        return {
+        analysis_result = {
             "analysis_id": analysis_id,
             "task_id": source["task_id"],
             "attempt_id": source["attempt_id"],
@@ -245,6 +249,16 @@ def create_velocity_analysis(
             "analysis_version": analysis["analysis_version"],
             "artifacts": {name: ARTIFACTS[name][0] for name in ["manifest", *names]},
         }
+        try:
+            from .result_envelope_service import publish_result_envelope
+
+            publish_result_envelope(analysis_result, artifacts_dir=root)
+        except BaseException:
+            # This invocation alone created the destination. Never expose a
+            # partially published new analysis or delete an existing analysis.
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        return analysis_result
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
