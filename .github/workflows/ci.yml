@@ -475,7 +475,10 @@ jobs:
           PYTHON
       - name: Verify separate simulation and verification workers, ensembles and SSE
         run: |
-          docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach --wait --wait-timeout 180 api redis verification-worker
+          docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach --wait --wait-timeout 180 api redis
+          # The verifier serves no HTTP and intentionally disables the image's
+          # HTTP healthcheck; the queued verification below checks its readiness.
+          docker compose -f docker-compose.yml -f compose.worker.yml up --build --detach verification-worker
           python - <<'PYTHON'
           import json
           import subprocess
