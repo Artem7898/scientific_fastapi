@@ -124,7 +124,22 @@ curl -N http://localhost:8000/api/v1/simulations/TASK_ID/events
 curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/cancel
 ```
 
-Cancellation returns `202` to acknowledge the request; check the eventual state through polling or SSE. Event history is bounded. On reconnect, send the last received `id` in `Last-Event-ID`; if replay history is unavailable, the stream reports a reset and the current state. Progress belongs to an execution attempt: recovery restarts from the saved seed, without a checkpoint.
+Cancellation returns `202` to acknowledge the request; check the eventual state through polling or SSE. Event history is bounded. On reconnect, send the last received `id` in `Last-Event-ID`; if replay history is unavailable, the stream reports a reset and the current state. Progress belongs to an attempt. Checkpoints are disabled by default and retries restart from the seed; when enabled, workers continue from the latest registered compatible checkpoint.
+
+## Checkpoints and continuation
+
+Set `CHECKPOINT_INTERVAL_STEPS`, for example `100`, in the embedded process or every worker sharing the queue. Its default `0` disables saving. State is published atomically after a completed step and sample: positions/velocities, PCG64 state, integrator and accumulated samples, plus LJ forces, neighbor lists and work counters. The cadence may increase to stay within `32` registered checkpoints and `512 MiB` per task.
+
+```bash
+curl http://localhost:8000/api/v1/simulations/TASK_ID/checkpoints
+curl http://localhost:8000/api/v1/simulations/TASK_ID/checkpoints/CHECKPOINT_ID
+curl -X POST http://localhost:8000/api/v1/simulations/TASK_ID/resume \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+Lease recovery uses only registered checkpoints. Manual resume accepts failed/cancelled standalone tasks, retaining the task ID, parameters and seed while creating a new attempt. Completed tasks and ensemble children cannot be reopened manually. Repeating the same active resume returns `202`; each task permits up to `32` manual resumptions.
+
+Corrupt or incompatible state never silently restarts from the seed: failures use `CHECKPOINT_INTEGRITY_FAILED` or `REPRODUCIBILITY_CONFLICT`. Repeatability covers scientific arrays, samples and observables in a supported environment, not UUIDs, timestamps or the bytes of ZIP files/manifests. See the [API reference](docs/api_reference.md) for downloads and compatibility limits.
 
 ## Ensembles of independent replicas
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add optional bounded deterministic checkpoints for all three models, with PCG64 state, sampled prefixes, model caches and LJ work counters preserved across continuation.
+- Resume leased retries from the latest owner-fenced registered checkpoint; expose explicit integrity/compatibility failures instead of silently restarting incompatible state.
+- Add checkpoint discovery, verified downloads and bounded manual resume for failed/cancelled standalone tasks while preserving physical payloads, existing result responses and ensemble accounting.
+- Record checkpoint lineage in provenance and run manifests; keep checkpoint state downloads separate from the existing bounded scientific RO-Crate export.
 - Archive lifecycle transitions and committed evidence atomically with queue state, with an untrimmed Redis journal independent of live-task TTL and a process-local memory equivalent.
 - Add archived provenance, paginated task timelines, W3C PROV JSON-LD graphs, stable artifact occurrence identifiers and saved-analysis links without inventing historical events or user identities.
 - Export bounded generic RO-Crate 1.1 ZIP packages from verified committed bytes; keep result licensing, signatures and scientific validation distinct from provenance integrity.
@@ -30,7 +34,7 @@
 - Separate HTTP producers and standalone workers with explicit execution roles and a shared Redis queue/artifact configuration.
 - Add attempt-fenced task progress, bounded SSE replay, and cooperative cancellation without changing existing status polling.
 - Accept reproducible ensembles atomically with saved seed schedules, idempotent admission, retained child contributions, and explicit all-success uncertainty rules.
-- Preserve the OU physics and synchronous bounded-thread analysis API; recovery restarts from the seed rather than a checkpoint.
+- Preserve the OU physics and synchronous bounded-thread analysis API; recovery without a registered checkpoint restarts from the seed.
 - Require draining/stopping old embedded API and workers before the new API admits ensembles into the same Redis namespace; persisted records remain supported after the transition.
 
 ## 2.0.0

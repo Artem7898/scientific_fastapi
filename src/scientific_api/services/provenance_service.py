@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from ..core.task_store import TaskStore
+from ..domain.checkpoint import MAX_CHECKPOINTS_PER_TASK, checkpoint_parameters_sha256
+from ..domain.experiments import parameters_from_payload
+from ..schemas.checkpoint import CheckpointDescriptor
 from ..schemas.provenance import (
     ProvenanceAnalysis,
     ProvenanceArtifact,
@@ -402,9 +405,33 @@ class ProvenanceService:
             raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
         if envelope and envelope.attempt_id not in {item.attempt_id for item in attempts}:
             raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
+        checkpoints = [
+            CheckpointDescriptor.model_validate(item) for item in archive.get("checkpoints", [])
+        ]
+        if len(checkpoints) > MAX_CHECKPOINTS_PER_TASK:
+            raise ProvenanceError("PROVENANCE_LIMIT_EXCEEDED", 413)
+        checkpoint_ids = {item.checkpoint_id for item in checkpoints}
+        if len(checkpoint_ids) != len(checkpoints):
+            raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
+        if checkpoints:
+            parameters_digest = checkpoint_parameters_sha256(parameters_from_payload(payload))
+            if any(
+                item.task_id != archive["task_id"]
+                or item.attempt_id not in {attempt.attempt_id for attempt in attempts}
+                or item.parameters_sha256 != parameters_digest
+                for item in checkpoints
+            ):
+                raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
+        selected = archive.get("selected_checkpoint")
+        selected_checkpoint = CheckpointDescriptor.model_validate(selected) if selected else None
+        if selected_checkpoint is not None and not any(
+            item == selected_checkpoint for item in checkpoints
+        ):
+            raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
         limitations = [
             "Unsigned saved metadata and bytes are checked against the committed archive; no author authentication or independent scientific verification is performed",
-            "Journal events and attempt claims do not imply checkpoints, deterministic continuation or recorded human identity",
+            "Checkpoint descriptors report registered metadata; checkpoint files and current execution compatibility are not rechecked by this provenance view",
+            "Recorded continuation identifies the source checkpoint and attempt; it does not assert cross-environment reproducibility or recorded human identity",
         ]
         if archive["coverage"] == "partial":
             limitations.append(
@@ -446,6 +473,11 @@ class ProvenanceService:
             attempts=attempts,
             artifacts=self._artifacts(archive, envelope),
             analyses=analysis_records,
+            checkpoints=checkpoints,
+            selected_checkpoint=selected_checkpoint,
+            resume_count=archive.get("resume_count", 0),
+            previous_outcomes=archive.get("previous_outcomes", []),
+            continuation=envelope.continuation if envelope else None,
             limitations=limitations,
         )
 
@@ -563,7 +595,55 @@ class ProvenanceService:
                 }
             if committed and software_identifier:
                 node["prov:wasAssociatedWith"] = _reference(software_identifier)
+            if committed and envelope is not None and envelope.continuation is not None:
+                node["sf:continuation"] = _json_literal(envelope.continuation)
             add(node)
+
+        checkpoint_identifiers = {}
+        for checkpoint in task.checkpoints:
+            identifier = f"{URN}checkpoint:{task.task_id}:{checkpoint.checkpoint_id}"
+            checkpoint_identifiers[checkpoint.checkpoint_id] = identifier
+            add(
+                {
+                    "@id": identifier,
+                    "@type": "prov:Entity",
+                    "sf:checkpointId": checkpoint.checkpoint_id,
+                    "sf:modelVersion": checkpoint.model_version,
+                    "sf:completedSteps": checkpoint.completed_steps,
+                    "sf:totalSteps": checkpoint.total_steps,
+                    "sf:parametersSha256": checkpoint.parameters_sha256,
+                    "sf:fingerprintSha256": checkpoint.fingerprint_sha256,
+                    "sf:manifestSha256": checkpoint.manifest.sha256,
+                    "sf:stateSha256": checkpoint.state.sha256,
+                    "sf:manifestPath": checkpoint.manifest.path,
+                    "sf:statePath": checkpoint.state.path,
+                    "sf:integrityStatus": "recorded_not_rechecked",
+                    "prov:wasGeneratedBy": _reference(attempt_identifiers[checkpoint.attempt_id]),
+                    "prov:generatedAtTime": {
+                        "@value": checkpoint.created_at,
+                        "@type": "xsd:dateTime",
+                    },
+                }
+            )
+        for event in events:
+            if event.event_type != "attempt_resumed":
+                continue
+            checkpoint_id = event.details.get("checkpoint_id")
+            checkpoint = next(
+                (item for item in task.checkpoints if item.checkpoint_id == checkpoint_id), None
+            )
+            if (
+                checkpoint is None
+                or event.attempt_id not in attempt_identifiers
+                or checkpoint.attempt_id != event.details.get("parent_attempt_id")
+                or checkpoint.completed_steps != event.details.get("completed_steps")
+            ):
+                raise ProvenanceError("PROVENANCE_INTEGRITY_FAILED")
+            resumed = nodes[attempt_identifiers[event.attempt_id]]
+            resumed["prov:used"].append(_reference(checkpoint_identifiers[checkpoint_id]))
+            resumed["prov:wasInformedBy"] = _reference(attempt_identifiers[checkpoint.attempt_id])
+            resumed["sf:executionMode"] = "resumed_run"
+            resumed["sf:completedStepsAtStart"] = checkpoint.completed_steps
 
         def artifact_node(
             record: ProvenanceArtifact, activity: str, derived: list[str] | None = None
@@ -680,6 +760,9 @@ class ProvenanceService:
                 }
             if event.attempt_id in attempt_identifiers:
                 node["sf:attempt"] = _reference(attempt_identifiers[event.attempt_id])
+            checkpoint_id = event.details.get("checkpoint_id")
+            if isinstance(checkpoint_id, str) and checkpoint_id in checkpoint_identifiers:
+                node["sf:checkpoint"] = _reference(checkpoint_identifiers[checkpoint_id])
             add(node)
         return ProvenanceGraph.model_validate(
             {

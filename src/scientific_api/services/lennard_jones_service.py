@@ -1,5 +1,7 @@
 """Execute a bounded, versioned LJ experiment and publish auditable artifacts."""
 
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -9,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -17,7 +19,7 @@ from ..core.experiment_tracker import ExperimentTracker
 from ..domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from ..models.lennard_jones_engine import create_lj_simulator
 from ..research.lj_analysis import ANALYSIS_VERSION, SERIES_NAMES, analyze_lj_observables
-from .langevin_service import _array_record, _run_directory, _write_arrays
+from .langevin_service import _array_record, _restore_sample_prefix, _run_directory, _write_arrays
 from .simulation_service import (
     _check_cancelled,
     _environment,
@@ -25,6 +27,9 @@ from .simulation_service import (
     _sha256,
     _write_manifest,
 )
+
+if TYPE_CHECKING:
+    from .checkpoint_service import CheckpointControl
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ def run_lj_simulation(
     tracker: ExperimentTracker | None = None,
     cancel_event: Event | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_control: CheckpointControl | None = None,
 ) -> dict[str, Any]:
     """Compute one scientific attempt; only the queue may commit its result.
 
@@ -49,6 +55,10 @@ def run_lj_simulation(
         raise TypeError("parameters must be LennardJonesParameters")
     _check_cancelled(cancel_event)
     root = Path(artifacts_dir).resolve()
+    if checkpoint_control is not None:
+        checkpoint_control.validate_run(
+            parameters, task_id=task_id, attempt_id=attempt_id, artifacts_dir=root
+        )
     run_dir = _run_directory(root, task_id, attempt_id)
     sample_steps = np.asarray(parameters.sampling_steps(), dtype=np.int64)
     times = sample_steps.astype(np.float64) * parameters.time_step
@@ -66,18 +76,42 @@ def run_lj_simulation(
                     **({"attempt_id": attempt_id} if attempt_id is not None else {}),
                 }
             )
-        simulator = create_lj_simulator(parameters)
+        loaded = checkpoint_control.loaded if checkpoint_control is not None else None
+        if loaded is None:
+            simulator = create_lj_simulator(parameters)
         trajectory = np.empty((len(sample_steps), parameters.num_particles, 2), dtype=np.float64)
-        trajectory[0] = simulator.unwrapped_positions
         series = {name: np.empty(len(sample_steps), dtype=np.float64) for name in SERIES_NAMES}
-        initial_observables = simulator.observables()
-        for name in SERIES_NAMES:
-            series[name][0] = initial_observables[name]
-        next_sample = 1
+        if loaded is None:
+            trajectory[0] = simulator.unwrapped_positions
+            initial_observables = simulator.observables()
+            for name in SERIES_NAMES:
+                series[name][0] = initial_observables[name]
+            start_step, next_sample = 0, 1
+            if checkpoint_control is not None:
+                checkpoint_control.save_if_due(
+                    0,
+                    simulator,
+                    samples={
+                        "trajectory": trajectory[:next_sample],
+                        **{name: values[:next_sample] for name, values in series.items()},
+                    },
+                    next_sample=next_sample,
+                )
+        else:
+            from ..models.checkpoint_state import restore_simulator
+
+            next_sample = _restore_sample_prefix(
+                loaded, sample_steps, trajectory, parameters.num_steps, series=series
+            )
+            simulator = restore_simulator(parameters, loaded.model_metadata, loaded.model_arrays)
+            start_step = loaded.completed_steps
+            loaded = None
+            assert checkpoint_control is not None
+            checkpoint_control.release_loaded()
         last_progress = monotonic()
         if progress_callback is not None:
-            progress_callback(0, parameters.num_steps, "computing")
-        for step in range(1, parameters.num_steps + 1):
+            progress_callback(start_step, parameters.num_steps, "computing")
+        for step in range(start_step + 1, parameters.num_steps + 1):
             _check_cancelled(cancel_event)
             simulator.advance()
             if next_sample < len(sample_steps) and step == sample_steps[next_sample]:
@@ -86,6 +120,18 @@ def run_lj_simulation(
                 for name in SERIES_NAMES:
                     series[name][next_sample] = values[name]
                 next_sample += 1
+            if checkpoint_control is not None:
+                # Capture the completed transition and initialized samples
+                # before terminal RDF work is charged to the model budget.
+                checkpoint_control.save_if_due(
+                    step,
+                    simulator,
+                    samples={
+                        "trajectory": trajectory[:next_sample],
+                        **{name: values[:next_sample] for name, values in series.items()},
+                    },
+                    next_sample=next_sample,
+                )
             if progress_callback is not None:
                 now = monotonic()
                 if step == parameters.num_steps or now - last_progress >= 0.5:
@@ -258,6 +304,8 @@ def run_lj_simulation(
                 },
             ],
         }
+        if checkpoint_control is not None:
+            manifest["continuation"] = checkpoint_control.manifest_metadata()
         json.dumps(result, allow_nan=False)
         _check_cancelled(cancel_event)
         _write_manifest(run_dir / "manifest.json", manifest)

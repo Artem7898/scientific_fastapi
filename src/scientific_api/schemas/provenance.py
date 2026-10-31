@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt
 
+from .checkpoint import CheckpointDescriptor
+
 ArchiveCoverage = Literal["complete", "partial"]
 ArchiveStorage = Literal["memory", "redis"]
 EvidenceStatus = Literal["verified", "unavailable"]
@@ -71,6 +73,12 @@ class ProvenanceTask(_ProvenanceModel):
     attempts: list[ProvenanceAttempt] = Field(default_factory=list)
     artifacts: list[ProvenanceArtifact] = Field(default_factory=list)
     analyses: list[ProvenanceAnalysis] = Field(default_factory=list)
+    checkpoints: list[CheckpointDescriptor] = Field(default_factory=list, max_length=32)
+    checkpoint_integrity_status: Literal["recorded_not_rechecked"] = "recorded_not_rechecked"
+    selected_checkpoint: CheckpointDescriptor | None = None
+    resume_count: StrictInt = Field(default=0, ge=0, le=32)
+    previous_outcomes: list[dict[str, Any]] = Field(default_factory=list, max_length=32)
+    continuation: dict[str, Any] | None = None
     limitations: list[str] = Field(default_factory=list)
 
 

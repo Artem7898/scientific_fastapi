@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     task_ttl_seconds: int = Field(default=3600, ge=1)
     task_lease_seconds: int = Field(default=30, ge=3, le=3600)
     max_task_attempts: int = Field(default=3, ge=1, le=100)
+    checkpoint_interval_steps: int = Field(default=0, ge=0, le=10_000)
     shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     event_poll_interval_seconds: float = Field(default=0.25, gt=0, le=5)
     sse_max_connections: int = Field(default=32, ge=1, le=1024)
