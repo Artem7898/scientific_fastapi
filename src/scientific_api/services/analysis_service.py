@@ -1,5 +1,7 @@
 """Analyze a committed velocity snapshot and atomically publish new artifacts."""
 
+from __future__ import annotations
+
 import hashlib
 import importlib.metadata
 import json
@@ -13,14 +15,18 @@ import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from .. import __version__
+from ..core.task_store import ArchiveCapacityError
 from ..domain.simulation import MODEL_VERSION, SimulationParameters
 from ..research.reporting import REPORT_VERSION, render_velocity_report
 from ..research.velocity_analysis import analyze_velocities, load_velocity_state
+
+if TYPE_CHECKING:
+    from ..core.task_store import TaskStore
 
 ARTIFACTS = {
     "analysis": ("analysis.json", "application/json"),
@@ -35,6 +41,10 @@ MAX_REPORT_BYTES = 16 * 1024 * 1024
 
 class AnalysisSourceError(ValueError):
     """The committed run cannot be safely interpreted or verified."""
+
+
+class AnalysisArchiveError(RuntimeError):
+    """The archive write was attempted, but its outcome was not confirmed."""
 
 
 def _read_bytes(path: Path, maximum: int) -> bytes:
@@ -169,7 +179,12 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def create_velocity_analysis(
-    result: dict[str, Any], *, artifacts_dir: Path, bins: int, formats: tuple[str, ...]
+    result: dict[str, Any],
+    *,
+    artifacts_dir: Path,
+    bins: int,
+    formats: tuple[str, ...],
+    provenance_store: TaskStore | None = None,
 ) -> dict[str, Any]:
     """Read one verified source snapshot; never call the simulation engine."""
     root = Path(artifacts_dir).resolve()
@@ -249,14 +264,39 @@ def create_velocity_analysis(
             "analysis_version": analysis["analysis_version"],
             "artifacts": {name: ARTIFACTS[name][0] for name in ["manifest", *names]},
         }
+        archive_attempted = False
         try:
+            from .provenance_evidence import build_archive_evidence
             from .result_envelope_service import publish_result_envelope
 
-            publish_result_envelope(analysis_result, artifacts_dir=root)
+            envelope = publish_result_envelope(analysis_result, artifacts_dir=root)
+            if provenance_store is not None:
+                evidence = build_archive_evidence(envelope)
+                archive_attempted = True
+                try:
+                    provenance_store.register_analysis(
+                        source["task_id"],
+                        source["attempt_id"],
+                        analysis_id,
+                        analysis_result,
+                        evidence=evidence,
+                    )
+                except ArchiveCapacityError:
+                    # This is an explicit rejection before the atomic write,
+                    # unlike an acknowledgement lost after a possible commit.
+                    archive_attempted = False
+                    raise
+                except Exception as error:
+                    raise AnalysisArchiveError(
+                        "Analysis archive write was not confirmed"
+                    ) from error
         except BaseException:
-            # This invocation alone created the destination. Never expose a
-            # partially published new analysis or delete an existing analysis.
-            shutil.rmtree(destination, ignore_errors=True)
+            if not archive_attempted:
+                # No archive can reference an incomplete unpublished analysis.
+                shutil.rmtree(destination, ignore_errors=True)
+            # A Redis acknowledgement can be lost after its atomic commit.
+            # Once registration was attempted, retain the complete files so
+            # durable evidence never points to data removed by this handler.
             raise
         return analysis_result
     finally:

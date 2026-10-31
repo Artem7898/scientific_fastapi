@@ -3,11 +3,14 @@
 import hashlib
 import importlib.metadata
 import importlib.util
+import io
 import json
 import math
 import os
 import sys
 import tempfile
+import time
+import zipfile
 from pathlib import Path
 
 
@@ -18,6 +21,7 @@ def main() -> None:
     import numpy as np
 
     import scientific_api
+    from scientific_api.core.task_store import MemoryTaskStore
     from scientific_api.domain.langevin import LangevinParameters
     from scientific_api.domain.lennard_jones import LennardJonesParameters
     from scientific_api.domain.simulation import SimulationParameters
@@ -38,6 +42,9 @@ def main() -> None:
         list_model_contracts,
         model_contract_sha256,
     )
+    from scientific_api.services.provenance_evidence import build_archive_evidence
+    from scientific_api.services.provenance_export import export_ro_crate
+    from scientific_api.services.provenance_service import ProvenanceService
     from scientific_api.services.result_envelope_service import read_result_envelope
     from scientific_api.services.simulation_service import run_simulation
 
@@ -188,6 +195,108 @@ def main() -> None:
         assert observed["rdf"]["dimensions"] == 2
         assert observed["energy_drift"]["applicable"] is True
 
+        store = MemoryTaskStore(ttl_seconds=0.01)
+        payload = {
+            "initial_temperature": 1.0,
+            "num_particles": 8,
+            "num_steps": 3,
+            "time_step": 0.001,
+            "seed": 2**64 - 1,
+            "backend": "numpy",
+        }
+        store.submit("core_archived", payload, {})
+        job = store.claim()
+        assert job is not None
+        archived_result = run_simulation(
+            SimulationParameters(**payload),
+            task_id=job.task_id,
+            attempt_id=job.owner,
+            artifacts_dir=root,
+        )
+        envelope = read_result_envelope(archived_result, artifacts_dir=root, require_present=True)
+        assert store.finish(job, archived_result, evidence=build_archive_evidence(envelope))
+        analysis = create_velocity_analysis(archived_result, artifacts_dir=root, bins=4, formats=())
+        analysis_envelope = read_result_envelope(
+            archived_result,
+            artifacts_dir=root,
+            analysis_id=analysis["analysis_id"],
+            require_present=True,
+        )
+        store.register_analysis(
+            job.task_id,
+            job.owner,
+            analysis["analysis_id"],
+            analysis,
+            evidence=build_archive_evidence(analysis_envelope),
+        )
+        time.sleep(0.02)
+        assert store.get(job.task_id) is None
+        provenance = ProvenanceService(store, root)
+        archived = provenance.task(job.task_id)
+        assert archived.coverage == "complete" and archived.storage == "memory"
+        assert archived.record == archived_result
+        assert archived.evidence_status == "verified"
+        assert archived.parameters["seed"] == 2**64 - 1
+        assert provenance.analysis(analysis["analysis_id"]).record == analysis
+        assert archived.artifacts
+        assert provenance.artifact(archived.artifacts[0].artifact_id) == archived.artifacts[0]
+        first_page = provenance.timeline(job.task_id, limit=2)
+        assert len(first_page.events) == 2 and first_page.has_more
+        assert first_page.next_cursor is not None
+        remaining = provenance.timeline(job.task_id, after_id=first_page.next_cursor)
+        events = first_page.events + remaining.events
+        assert {item.event_type for item in events} >= {
+            "submitted",
+            "attempt_claimed",
+            "completed",
+            "analysis_completed",
+        }
+        graph = provenance.graph(job.task_id).model_dump(mode="json", by_alias=True)
+        assert graph["@context"] and graph["@graph"]
+        package, filename = export_ro_crate(provenance, job.task_id)
+        assert filename.endswith(".zip")
+        with zipfile.ZipFile(io.BytesIO(package)) as archive:
+            assert {
+                "ro-crate-metadata.json",
+                "provenance.jsonld",
+                "task.json",
+                "model-contract.json",
+            } <= set(archive.namelist())
+            assert all(
+                not Path(name).is_absolute() and ".." not in Path(name).parts
+                for name in archive.namelist()
+            )
+            metadata = json.loads(archive.read("ro-crate-metadata.json"))
+            dataset = next(item for item in metadata["@graph"] if item["@id"] == "./")
+            assert dataset["license"] == {"@id": "#data-license-unavailable"}
+            assert any(
+                entity.get("@id") == "#data-license-unavailable" for entity in metadata["@graph"]
+            )
+            assert not any(item.get("@type") == "Person" for item in metadata["@graph"])
+            for record in [
+                *archived.artifacts,
+                *provenance.analysis(analysis["analysis_id"]).artifacts,
+            ]:
+                assert hashlib.sha256(archive.read(record.path)).hexdigest() == record.sha256
+            unpacked = root / "roundtrip"
+            archive.extractall(unpacked)
+        assert (
+            read_result_envelope(
+                archived_result, artifacts_dir=unpacked, require_present=True
+            ).integrity.status
+            == "verified"
+        )
+        assert (
+            read_result_envelope(
+                archived_result,
+                artifacts_dir=unpacked,
+                analysis_id=analysis["analysis_id"],
+                require_present=True,
+            ).integrity.status
+            == "verified"
+        )
+        store.close()
+
     for operation in (
         lambda: require_backend("numba"),
         lambda: create_simulator(
@@ -218,7 +327,7 @@ def main() -> None:
     assert "scientific_api.models.langevin_numba" not in sys.modules
     assert "scientific_api.models.lj_numba" not in sys.modules
     print(
-        "Core-only wheel: model catalog, OU/Langevin/LJ envelopes and analysis; extras stay absent"
+        "Core-only wheel: models, envelopes, archived provenance after TTL and RO-Crate roundtrip"
     )
 
 

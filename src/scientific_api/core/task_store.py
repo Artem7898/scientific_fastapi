@@ -1,6 +1,7 @@
 """Atomic leased queues, bounded replay and durable ensemble contributions.
 
-Only terminal state expires. Delivery is at least once; owner tokens fence
+Only operational terminal state expires; the separate provenance journal does not.
+Delivery is at least once; owner tokens fence
 results and progress, not external side effects. Redis supports a standalone
 instance, and is imported only when its backend is selected.
 """
@@ -21,10 +22,19 @@ from uuid import uuid4
 
 EVENT_LIMIT = 256
 TERMINAL = {"completed", "failed", "cancelled"}
+IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+MAX_ARCHIVE_JSON_BYTES = 2 * 1024 * 1024
+MAX_EVIDENCE_BYTES = 256 * 1024
+MAX_ARCHIVED_ANALYSES = 256
 
 
 class QueueFull(Exception):
     """Pending and running capacity is exhausted."""
+
+
+class ArchiveCapacityError(Exception):
+    """A task has no room for another immutable analysis occurrence."""
 
 
 @dataclass(frozen=True)
@@ -41,7 +51,16 @@ class TaskStore(Protocol):
     def get(self, task_id: str) -> dict[str, Any] | None: ...
     def claim(self) -> Job | None: ...
     def heartbeat(self, job: Job) -> bool: ...
-    def finish(self, job: Job, result: dict[str, Any]) -> bool: ...
+    def finish(self, job: Job, result: dict[str, Any], *, evidence: dict | None = None) -> bool: ...
+    def get_task_archive(self, task_id: str) -> dict | None: ...
+    def timeline(
+        self, task_id: str, after_id: str | None = None, limit: int = 100
+    ) -> dict | None: ...
+    def register_analysis(
+        self, task_id: str, attempt_id: str, analysis_id: str, record: dict, *, evidence: dict
+    ) -> None: ...
+    def get_analysis_archive(self, analysis_id: str) -> dict | None: ...
+    def get_artifact_archive(self, artifact_id: str) -> dict | None: ...
     def release(self, job: Job) -> bool: ...
     def report_progress(
         self, job: Job, completed_steps: int, total_steps: int, phase: str
@@ -67,6 +86,102 @@ class TaskStore(Protocol):
 
 def _now() -> float:
     return time.time()
+
+
+def _identifier(value: str) -> None:
+    if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+        raise ValueError("Invalid archive identifier")
+
+
+def _archive_json(value: dict, maximum: int = MAX_ARCHIVE_JSON_BYTES) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("Archive records must be JSON objects")
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(raw.encode()) > maximum:
+        raise ValueError("Archive record exceeds its size limit")
+    return raw
+
+
+def _timeline_cursor(after_id: str | None, limit: int) -> None:
+    _cursor(after_id, limit)
+    if after_id is not None and (
+        len(after_id) > 41
+        or not re.fullmatch(r"[0-9]+-[0-9]+", after_id)
+        or any(int(part) > 2**64 - 1 for part in after_id.split("-"))
+    ):
+        raise ValueError("Invalid archive event cursor")
+
+
+def _evidence_records(
+    task_id: str, attempt_id: str, analysis_id: str | None, evidence: dict | None
+) -> tuple[str, list[dict]]:
+    if evidence is None:
+        return "", []
+    raw = _archive_json(evidence, MAX_EVIDENCE_BYTES)
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence["schema_version"] != 1
+        or not isinstance(evidence.get("model_version"), str)
+        or not isinstance(evidence.get("model_contract_sha256"), str)
+        or not DIGEST.fullmatch(evidence["model_contract_sha256"])
+        or not isinstance(evidence.get("manifest_sha256"), str)
+        or not DIGEST.fullmatch(evidence["manifest_sha256"])
+        or not isinstance(evidence.get("manifest"), dict)
+        or not isinstance(evidence.get("artifacts"), list)
+        or not 1 <= len(evidence["artifacts"]) <= 32
+    ):
+        raise ValueError("Invalid archive evidence")
+    prefix = f"{task_id}/{attempt_id}/"
+    if analysis_id is not None:
+        prefix += f"analyses/{analysis_id}/"
+    by_id = {}
+    for descriptor in [evidence["manifest"], *evidence["artifacts"]]:
+        if (
+            not isinstance(descriptor, dict)
+            or any(
+                not isinstance(descriptor.get(name), str)
+                for name in ("artifact_id", "name", "path", "sha256", "media_type")
+            )
+            or not DIGEST.fullmatch(descriptor["artifact_id"])
+            or not DIGEST.fullmatch(descriptor["sha256"])
+            or type(descriptor.get("bytes")) is not int
+            or descriptor["bytes"] < 0
+            or not descriptor["path"].startswith(prefix)
+            or any(part in {"", ".", ".."} for part in descriptor["path"].split("/"))
+            or "\\" in descriptor["path"]
+        ):
+            raise ValueError("Invalid archive artifact descriptor")
+        artifact_id = descriptor["artifact_id"]
+        if artifact_id in by_id and by_id[artifact_id] != descriptor:
+            raise ValueError("Conflicting archive artifact descriptors")
+        by_id[artifact_id] = descriptor
+    if evidence["manifest"].get("sha256") != evidence["manifest_sha256"]:
+        raise ValueError("Manifest evidence digest disagrees")
+    locators = [
+        {
+            "artifact_id": artifact_id,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "analysis_id": analysis_id,
+            "descriptor": descriptor,
+        }
+        for artifact_id, descriptor in by_id.items()
+    ]
+    return raw, locators
+
+
+def _analysis_record(task_id: str, attempt_id: str, analysis_id: str, record: dict) -> str:
+    for value in (task_id, attempt_id, analysis_id):
+        _identifier(value)
+    raw = _archive_json(record)
+    if (
+        record.get("task_id") != task_id
+        or record.get("attempt_id") != attempt_id
+        or record.get("analysis_id") != analysis_id
+        or record.get("status") != "completed"
+    ):
+        raise ValueError("Analysis record does not match its identity")
+    return raw
 
 
 def _validate_options(
@@ -192,6 +307,11 @@ class MemoryTaskStore:
         self._capacity, self._ttl = max_queue_size, ttl_seconds
         self._lease, self._max_attempts = lease_seconds, max_attempts
         self._entries: dict[str, _Entry] = {}
+        self._archives: dict[str, dict] = {}
+        self._journals: dict[str, list[dict]] = {}
+        self._analyses: dict[str, dict] = {}
+        self._artifacts: dict[str, dict] = {}
+        self._ensemble_archives: dict[str, dict] = {}
         self._ensembles: dict[str, _Ensemble] = {}
         self._idempotency: dict[str, tuple[str, str]] = {}
         self._pending: deque[str] = deque()
@@ -231,6 +351,62 @@ class MemoryTaskStore:
             {"event_id": f"{entry.sequence}-0", "data": self._snapshot(task_id, entry)}
         )
 
+    def _observe(self, task_id: str, entry: _Entry, now: float) -> dict:
+        archive = self._archives.get(task_id)
+        if archive is not None:
+            return archive
+        archive = {
+            "task_id": task_id,
+            "payload": copy.deepcopy(entry.payload),
+            "submitted_at": entry.submitted_at,
+            "ensemble_id": entry.ensemble_id,
+            "record": copy.deepcopy(entry.record),
+            "evidence": None,
+            "attempts": [],
+            "analyses": [],
+            "coverage": "partial",
+            "storage": "memory",
+        }
+        self._archives[task_id] = archive
+        self._journals[task_id] = []
+        owner = entry.owner or entry.record.get("attempt_id")
+        if owner:
+            archive["attempts"].append(
+                {"attempt_id": owner, "attempt": max(1, entry.attempts), "claimed_at": None}
+            )
+        self._journal(task_id, entry, "history_observed", now, {"coverage": "partial"})
+        return archive
+
+    def _journal(
+        self, task_id: str, entry: _Entry, event_type: str, now: float, details: dict | None = None
+    ) -> None:
+        archive = self._archives[task_id]
+        attempts = archive["attempts"]
+        attempt = attempts[-1] if attempts else None
+        events = self._journals[task_id]
+        events.append(
+            {
+                "event_id": f"{len(events) + 1}-0",
+                "event_type": event_type,
+                "occurred_at": now,
+                "attempt_id": attempt["attempt_id"] if attempt else None,
+                "attempt": attempt["attempt"] if attempt else 0,
+                "status": entry.record["status"],
+                "details": copy.deepcopy(details or {}),
+            }
+        )
+        archive["record"] = copy.deepcopy(entry.record)
+
+    def _check_artifacts(self, locators: list[dict]) -> None:
+        for locator in locators:
+            previous = self._artifacts.get(locator["artifact_id"])
+            if previous is not None and previous != locator:
+                raise ValueError("Artifact identifier conflicts with an archived occurrence")
+
+    def _index_artifacts(self, locators: list[dict]) -> None:
+        for locator in locators:
+            self._artifacts[locator["artifact_id"]] = copy.deepcopy(locator)
+
     def _add(
         self, task_id: str, payload: dict, carrier: dict, now: float, ensemble_id: str | None = None
     ) -> None:
@@ -246,12 +422,31 @@ class MemoryTaskStore:
         self._pending.append(task_id)
         self._active += 1
         self._emit(task_id, entry, "pending")
+        self._archives[task_id] = {
+            "task_id": task_id,
+            "payload": copy.deepcopy(payload),
+            "submitted_at": now,
+            "ensemble_id": ensemble_id,
+            "record": copy.deepcopy(entry.record),
+            "evidence": None,
+            "attempts": [],
+            "analyses": [],
+            "coverage": "complete",
+            "storage": "memory",
+        }
+        self._journals[task_id] = []
+        self._journal(task_id, entry, "submitted", now)
 
-    def _complete(self, task_id: str, entry: _Entry, record: dict, now: float) -> None:
+    def _complete(
+        self, task_id: str, entry: _Entry, record: dict, now: float, evidence: dict | None = None
+    ) -> None:
+        archive = self._observe(task_id, entry, now)
         entry.record = record
         if record["status"] == "completed":
             entry.completed_steps = entry.total_steps
         self._emit(task_id, entry, record["status"])
+        archive["evidence"] = copy.deepcopy(evidence) if record["status"] == "completed" else None
+        self._journal(task_id, entry, record["status"], now)
         entry.payload, entry.carrier, entry.owner = {}, {}, None
         entry.lease_until = 0
         entry.cancel_requested = False
@@ -268,11 +463,14 @@ class MemoryTaskStore:
             entry.expires_at = now + self._ttl
 
     def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None:
+        _identifier(task_id)
+        _archive_json(payload)
+        _archive_json(carrier)
         with self._lock:
             self._ensure_open()
             now = _now()
             self._cleanup(now)
-            if task_id in self._entries:
+            if task_id in self._entries or task_id in self._archives:
                 raise ValueError(f"Task already exists: {task_id}")
             if self._active >= self._capacity:
                 raise QueueFull("Pending and running task capacity has been reached")
@@ -307,7 +505,9 @@ class MemoryTaskStore:
                         now,
                     )
                 else:
+                    self._observe(task_id, entry, now)
                     entry.record = {"task_id": task_id, "status": "pending"}
+                    self._journal(task_id, entry, "retry", now, {"reason": "lease_expired"})
                     entry.owner = None
                     entry.completed_steps = 0
                     self._emit(task_id, entry, "retry")
@@ -317,10 +517,16 @@ class MemoryTaskStore:
                 entry = self._entries.get(task_id)
                 if entry is None or entry.record["status"] != "pending":
                     continue
+                archive = self._observe(task_id, entry, now)
                 entry.owner = str(uuid4())
                 entry.attempts += 1
                 entry.lease_until = now + self._lease
                 entry.record = {"task_id": task_id, "status": "running"}
+                previous = archive["attempts"][-1]["attempt"] if archive["attempts"] else 0
+                archive["attempts"].append(
+                    {"attempt_id": entry.owner, "attempt": previous + 1, "claimed_at": now}
+                )
+                self._journal(task_id, entry, "attempt_claimed", now)
                 self._emit(task_id, entry, "running")
                 return Job(
                     task_id,
@@ -351,26 +557,52 @@ class MemoryTaskStore:
             entry.lease_until = _now() + self._lease
             return True
 
-    def finish(self, job: Job, result: dict[str, Any]) -> bool:
+    def finish(self, job: Job, result: dict[str, Any], *, evidence: dict | None = None) -> bool:
         record = _terminal_result(job.task_id, result)
+        _archive_json(record)
+        _, locators = _evidence_records(job.task_id, job.owner, None, evidence)
+        if evidence is not None and record.get("attempt_id") != job.owner:
+            raise ValueError("Evidence must belong to the completed attempt")
         with self._lock:
             self._ensure_open()
             now = _now()
             entry = self._owned(job, now)
             if entry is None:
                 return False
+            accepted = record["status"] == "completed" and not entry.cancel_requested
+            if accepted:
+                self._check_artifacts(locators)
             self._complete(
                 job.task_id,
                 entry,
                 _cancelled(job.task_id) if entry.cancel_requested else record,
                 now,
+                evidence if accepted else None,
             )
+            if accepted:
+                self._index_artifacts(locators)
             return True
 
     def release(self, job: Job) -> bool:
-        return self.finish(
-            job, {"status": "cancelled", "error": "Simulation cancelled during shutdown"}
-        )
+        with self._lock:
+            self._ensure_open()
+            now = _now()
+            entry = self._owned(job, now)
+            if entry is None:
+                return False
+            self._observe(job.task_id, entry, now)
+            self._journal(job.task_id, entry, "released", now, {"reason": "worker_shutdown"})
+            record = (
+                _cancelled(job.task_id)
+                if entry.cancel_requested
+                else {
+                    "task_id": job.task_id,
+                    "status": "cancelled",
+                    "error": "Simulation cancelled during shutdown",
+                }
+            )
+            self._complete(job.task_id, entry, record, now)
+            return True
 
     def report_progress(self, job: Job, completed_steps: int, total_steps: int, phase: str) -> bool:
         _progress(completed_steps, total_steps, phase)
@@ -413,6 +645,8 @@ class MemoryTaskStore:
             return False
         if entry.record["status"] == "cancelled" or entry.cancel_requested:
             return True
+        self._observe(task_id, entry, now)
+        self._journal(task_id, entry, "cancel_requested", now)
         if entry.record["status"] == "pending":
             self._complete(task_id, entry, _cancelled(task_id), now)
         else:
@@ -441,6 +675,10 @@ class MemoryTaskStore:
         idempotency_key: str | None = None,
     ) -> str:
         fingerprint, token = _ensemble_input(ensemble_id, children, metadata, idempotency_key)
+        _archive_json(carrier)
+        _archive_json(metadata)
+        for _, payload in children:
+            _archive_json(payload)
         with self._lock:
             self._ensure_open()
             now = _now()
@@ -450,8 +688,10 @@ class MemoryTaskStore:
                 if previous_fingerprint != fingerprint:
                     raise ValueError("Idempotency key conflicts with the original request")
                 return previous_id
-            if ensemble_id in self._ensembles or any(
-                child in self._entries for child, _ in children
+            if (
+                ensemble_id in self._ensemble_archives
+                or ensemble_id in self._ensembles
+                or any(child in self._entries or child in self._archives for child, _ in children)
             ):
                 raise ValueError("An ensemble or child already exists")
             if self._active + len(children) > self._capacity:
@@ -459,6 +699,11 @@ class MemoryTaskStore:
             self._ensembles[ensemble_id] = _Ensemble(
                 copy.deepcopy(metadata), [child for child, _ in children], token=token
             )
+            self._ensemble_archives[ensemble_id] = {
+                "metadata": copy.deepcopy(metadata),
+                "children": [child for child, _ in children],
+                "submitted_at": now,
+            }
             if token:
                 self._idempotency[token] = ensemble_id, fingerprint
             for child, payload in children:
@@ -503,6 +748,93 @@ class MemoryTaskStore:
                 self._cancel(child, now)
             return True
 
+    def get_task_archive(self, task_id: str) -> dict | None:
+        _identifier(task_id)
+        with self._lock:
+            self._ensure_open()
+            archive = copy.deepcopy(self._archives.get(task_id))
+            if archive is not None:
+                events = self._journals[task_id]
+                archive["last_event_id"] = events[-1]["event_id"] if events else None
+            return archive
+
+    def timeline(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
+        _identifier(task_id)
+        _timeline_cursor(after_id, limit)
+        with self._lock:
+            self._ensure_open()
+            if task_id not in self._archives:
+                return None
+            cursor = tuple(map(int, (after_id or "0-0").split("-")))
+            events = [
+                event
+                for event in self._journals[task_id]
+                if tuple(map(int, event["event_id"].split("-"))) > cursor
+            ]
+            selected = events[:limit]
+            return {
+                "task_id": task_id,
+                "events": copy.deepcopy(selected),
+                "next_cursor": selected[-1]["event_id"] if selected else None,
+                "has_more": len(events) > limit,
+            }
+
+    def register_analysis(
+        self, task_id: str, attempt_id: str, analysis_id: str, record: dict, *, evidence: dict
+    ) -> None:
+        _analysis_record(task_id, attempt_id, analysis_id, record)
+        _, locators = _evidence_records(task_id, attempt_id, analysis_id, evidence)
+        item = {
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "analysis_id": analysis_id,
+            "record": copy.deepcopy(record),
+            "evidence": copy.deepcopy(evidence),
+        }
+        with self._lock:
+            self._ensure_open()
+            self._cleanup(_now())
+            archive = self._archives.get(task_id)
+            entry = self._entries.get(task_id)
+            parent = archive["record"] if archive else entry.record if entry else None
+            if (
+                parent is None
+                or parent.get("status") != "completed"
+                or parent.get("attempt_id") != attempt_id
+            ):
+                raise ValueError("Analysis requires the committed completed parent attempt")
+            previous = self._analyses.get(analysis_id)
+            if previous is not None:
+                if previous != item:
+                    raise ValueError("Analysis identifier conflicts with an archived analysis")
+                return
+            if archive is not None and len(archive["analyses"]) >= MAX_ARCHIVED_ANALYSES:
+                raise ArchiveCapacityError("The task analysis archive capacity is exhausted")
+            self._check_artifacts(locators)
+            now = _now()
+            if archive is None:
+                assert entry is not None
+                archive = self._observe(task_id, entry, now)
+            if entry is None:
+                entry = _Entry({}, {}, archive["submitted_at"] or now, parent)
+            self._analyses[analysis_id] = item
+            archive["analyses"].append(copy.deepcopy(item))
+            self._index_artifacts(locators)
+            self._journal(task_id, entry, "analysis_completed", now, {"analysis_id": analysis_id})
+
+    def get_analysis_archive(self, analysis_id: str) -> dict | None:
+        _identifier(analysis_id)
+        with self._lock:
+            self._ensure_open()
+            return copy.deepcopy(self._analyses.get(analysis_id))
+
+    def get_artifact_archive(self, artifact_id: str) -> dict | None:
+        if not isinstance(artifact_id, str) or not DIGEST.fullmatch(artifact_id):
+            raise ValueError("Invalid artifact identifier")
+        with self._lock:
+            self._ensure_open()
+            return copy.deepcopy(self._artifacts.get(artifact_id))
+
     def health(self) -> bool:
         with self._lock:
             return not self._closed
@@ -526,6 +858,55 @@ local active=prefix..'active'
 local function taskkey(id) return prefix..'task:'..id end
 local function streamkey(id) return prefix..'events:'..id end
 local function parentkey(id) return prefix..'ensemble:'..id end
+local function archivekey(id) return prefix..'archive:task:'..id end
+local function journalkey(id) return prefix..'archive:timeline:'..id end
+local function attemptskey(id) return prefix..'archive:attempts:'..id end
+local function analyseskey(id) return prefix..'archive:analyses:'..id end
+local function analysiskey(id) return prefix..'archive:analysis:'..id end
+local function artifactkey(id) return prefix..'archive:artifact:'..id end
+local function journal(id,event_type,details)
+    local ak=archivekey(id)
+    local state=redis.call('HGET',taskkey(id),'state') or redis.call('HGET',ak,'state')
+    local data=cjson.encode({event_type=event_type,occurred_at=now,
+        attempt_id=redis.call('HGET',ak,'last_attempt_id') or cjson.null,
+        attempt=tonumber(redis.call('HGET',ak,'attempt_count') or '0'),
+        status=state,details=details or {}})
+    redis.call('XADD',journalkey(id),'*','data',data)
+    redis.call('HSET',ak,'state',state)
+end
+local function observe(id,observed_owner)
+    local ak=archivekey(id)
+    if redis.call('EXISTS',ak)==1 then return end
+    local tk=taskkey(id)
+    local state=redis.call('HGET',tk,'state') or 'pending'
+    local owner=redis.call('HGET',tk,'owner') or observed_owner
+    local count=tonumber(redis.call('HGET',tk,'attempts') or '0')
+    if owner and count<1 then count=1 end
+    redis.call('HSET',ak,'payload',redis.call('HGET',tk,'payload') or '{}',
+        'submitted_at',redis.call('HGET',tk,'submitted_at') or '',
+        'ensemble_id',redis.call('HGET',tk,'ensemble_id') or '',
+        'record',redis.call('HGET',tk,'record') or '{}','state',state,
+        'coverage','partial','attempt_count',count)
+    if owner then
+        redis.call('HSET',ak,'last_attempt_id',owner)
+        redis.call('RPUSH',attemptskey(id),cjson.encode({attempt_id=owner,attempt=count,
+            claimed_at=cjson.null}))
+        if state=='completed' then redis.call('HSET',ak,'committed_attempt_id',owner) end
+    end
+    journal(id,'history_observed',{coverage='partial'})
+end
+local function check_indexes(indexes)
+    for _,item in ipairs(indexes) do
+        local previous=redis.call('GET',artifactkey(item.artifact_id))
+        if previous and previous~=item.raw then return false end
+    end
+    return true
+end
+local function index_artifacts(indexes)
+    for _,item in ipairs(indexes) do
+        redis.call('SET',artifactkey(item.artifact_id),item.raw)
+    end
+end
 local function emit(id,phase,completed,total)
     local key=taskkey(id)
     if completed then redis.call('HSET',key,'completed_steps',completed) end
@@ -540,9 +921,19 @@ end
 local function cancelled(id)
     return cjson.encode({task_id=id,status='cancelled',error='Simulation cancelled by request'})
 end
-local function complete(id,state,record)
+local function complete(id,state,record,evidence,indexes)
     local key=taskkey(id)
+    observe(id)
+    local ak=archivekey(id)
+    local owner=redis.call('HGET',key,'owner')
     redis.call('HSET',key,'state',state,'record',record)
+    redis.call('HSET',ak,'state',state,'record',record)
+    if state=='completed' and owner then redis.call('HSET',ak,'committed_attempt_id',owner) end
+    if state=='completed' and evidence and evidence~='' then
+        redis.call('HSET',ak,'evidence',evidence)
+        index_artifacts(indexes or {})
+    end
+    journal(id,state)
     if state=='completed' then
         redis.call('HSET',key,'completed_steps',redis.call('HGET',key,'total_steps') or '0')
     end
@@ -583,15 +974,21 @@ local function add(id,payload,carrier,total,parent)
         'submitted_at',tostring(now),'attempts',0,'state','pending','completed_steps',0,
         'total_steps',total,'record',cjson.encode({task_id=id,status='pending'}))
     if parent then redis.call('HSET',taskkey(id),'ensemble_id',parent) end
+    redis.call('HSET',archivekey(id),'payload',payload,'submitted_at',tostring(now),
+        'ensemble_id',parent or '','record',cjson.encode({task_id=id,status='pending'}),
+        'state','pending','coverage','complete','attempt_count',0)
     redis.call('RPUSH',pending,id)
     redis.call('SADD',active,id)
     emit(id,'pending')
+    journal(id,'submitted')
 end
 local function cancel(id)
     local key=taskkey(id)
     local state=redis.call('HGET',key,'state')
     if not state or state=='completed' or state=='failed' then return false end
     if state=='cancelled' or redis.call('HGET',key,'cancel_requested')=='1' then return true end
+    observe(id)
+    journal(id,'cancel_requested')
     if state=='pending' then complete(id,'cancelled',cancelled(id))
     else redis.call('HSET',key,'cancel_requested',1); emit(id,'cancel_requested') end
     return true
@@ -602,7 +999,7 @@ _SUBMIT = (
     _LUA
     + r"""
 local id=ARGV[3]
-if redis.call('EXISTS',taskkey(id))==1 then return -2 end
+if redis.call('EXISTS',taskkey(id))==1 or redis.call('EXISTS',archivekey(id))==1 then return -2 end
 if redis.call('SCARD',active)>=tonumber(ARGV[6]) then return -1 end
 add(id,ARGV[4],ARGV[5],ARGV[7]); return 1
 """
@@ -614,6 +1011,7 @@ local expired=redis.call('ZRANGEBYSCORE',running,'-inf',now)
 for _,id in ipairs(expired) do
     local key=taskkey(id)
     if redis.call('HGET',key,'state')=='running' then
+        observe(id)
         if redis.call('HGET',key,'cancel_requested')=='1' then
             complete(id,'cancelled',cancelled(id))
         elseif tonumber(redis.call('HGET',key,'attempts') or '0')>=tonumber(ARGV[5]) then
@@ -621,6 +1019,8 @@ for _,id in ipairs(expired) do
                 error='Worker lease expired; maximum attempts exhausted'}))
         else
             redis.call('HSET',key,'state','pending','record',cjson.encode({task_id=id,status='pending'}))
+            redis.call('HSET',archivekey(id),'record',cjson.encode({task_id=id,status='pending'}))
+            journal(id,'retry',{reason='lease_expired'})
             redis.call('HDEL',key,'owner','lease_until')
             emit(id,'retry',0)
             redis.call('RPUSH',pending,id)
@@ -633,10 +1033,18 @@ while true do
     if not id then return nil end
     local key=taskkey(id)
     if redis.call('HGET',key,'state')=='pending' then
+        observe(id)
         redis.call('HINCRBY',key,'attempts',1)
         redis.call('HSET',key,'state','running','owner',ARGV[3],
             'lease_until',tostring(now+tonumber(ARGV[4])),
             'record',cjson.encode({task_id=id,status='running'}))
+        local ak=archivekey(id)
+        local count=redis.call('HINCRBY',ak,'attempt_count',1)
+        redis.call('HSET',ak,'last_attempt_id',ARGV[3],
+            'record',cjson.encode({task_id=id,status='running'}))
+        redis.call('RPUSH',attemptskey(id),cjson.encode({attempt_id=ARGV[3],attempt=count,
+            claimed_at=now}))
+        journal(id,'attempt_claimed')
         redis.call('ZADD',running,now+tonumber(ARGV[4]),id)
         emit(id,'running')
         return {id,redis.call('HGET',key,'payload'),redis.call('HGET',key,'carrier'),
@@ -660,7 +1068,11 @@ local id=ARGV[3]
 if not owned(id,ARGV[4]) then return 0 end
 if redis.call('HGET',taskkey(id),'cancel_requested')=='1' then
     complete(id,'cancelled',cancelled(id))
-else complete(id,ARGV[5],ARGV[6]) end
+else
+    local indexes=cjson.decode(ARGV[8])
+    if ARGV[5]=='completed' and not check_indexes(indexes) then return -2 end
+    complete(id,ARGV[5],ARGV[6],ARGV[7],indexes)
+end
 return 1
 """
 )
@@ -670,13 +1082,17 @@ _RELEASE = (
 local id=ARGV[3]
 if not owned(id,ARGV[4]) then return 0 end
 local key=taskkey(id)
+observe(id)
+journal(id,'released',{reason='worker_shutdown'})
 if redis.call('HGET',key,'cancel_requested')=='1' then
     complete(id,'cancelled',cancelled(id)); return 1
 end
 redis.call('HSET',key,'state','pending','record',cjson.encode({task_id=id,status='pending'}))
+redis.call('HSET',archivekey(id),'record',cjson.encode({task_id=id,status='pending'}))
 redis.call('HDEL',key,'owner','lease_until')
 redis.call('HINCRBY',key,'attempts',-1)
 redis.call('ZREM',running,id); redis.call('RPUSH',pending,id)
+journal(id,'retry',{reason='worker_shutdown'})
 emit(id,'retry',0); return 1
 """
 )
@@ -752,15 +1168,20 @@ if token~='' then
     end
 end
 local children=cjson.decode(ARGV[4])
-if redis.call('EXISTS',parentkey(id))==1 then return {-2} end
+if redis.call('EXISTS',parentkey(id))==1
+    or redis.call('EXISTS',prefix..'archive:ensemble:'..id)==1 then return {-2} end
 for _,child in ipairs(children) do
-    if redis.call('EXISTS',taskkey(child.id))==1 then return {-2} end
+    if redis.call('EXISTS',taskkey(child.id))==1 or redis.call('EXISTS',archivekey(child.id))==1 then
+        return {-2}
+    end
 end
 if redis.call('SCARD',active)+#children>tonumber(ARGV[7]) then return {-1} end
 local ids={}
 for _,child in ipairs(children) do ids[#ids+1]=child.id end
 redis.call('HSET',parentkey(id),'metadata',ARGV[6],'children',cjson.encode(ids),
     'count',#ids,'finished',0,'cancel_requested',0)
+redis.call('HSET',prefix..'archive:ensemble:'..id,'metadata',ARGV[6],
+    'children',cjson.encode(ids),'submitted_at',tostring(now))
 if token~='' then
     redis.call('HSET',parentkey(id),'idempotency',token)
     redis.call('HSET',prefix..'idempotency:'..token,'ensemble_id',id,'fingerprint',fingerprint)
@@ -798,6 +1219,60 @@ if redis.call('HGET',pk,'finished')==redis.call('HGET',pk,'count') then
 end
 redis.call('HSET',pk,'cancel_requested',1)
 for _,id in ipairs(cjson.decode(redis.call('HGET',pk,'children'))) do cancel(id) end
+return 1
+"""
+)
+
+_GET_ARCHIVE = (
+    _LUA
+    + r"""
+local id=ARGV[3]
+if redis.call('EXISTS',archivekey(id))==0 then return nil end
+local analyses={}
+for _,analysis in ipairs(redis.call('LRANGE',analyseskey(id),0,-1)) do
+    analyses[#analyses+1]=redis.call('HGETALL',analysiskey(analysis))
+end
+local latest=redis.call('XREVRANGE',journalkey(id),'+','-','COUNT',1)
+return {redis.call('HGETALL',archivekey(id)),redis.call('LRANGE',attemptskey(id),0,-1),analyses,
+    #latest>0 and latest[1][1] or false}
+"""
+)
+_TIMELINE = (
+    _LUA
+    + r"""
+local id=ARGV[3]
+if redis.call('EXISTS',archivekey(id))==0 then return nil end
+if ARGV[4]=='18446744073709551615-18446744073709551615' then return {} end
+local start=ARGV[4]=='' and '-' or '('..ARGV[4]
+return redis.call('XRANGE',journalkey(id),start,'+','COUNT',tonumber(ARGV[5])+1)
+"""
+)
+_REGISTER_ANALYSIS = (
+    _LUA
+    + r"""
+local id=ARGV[3]; local owner=ARGV[4]; local analysis=ARGV[5]
+local ak=archivekey(id); local tk=taskkey(id); local destination=analysiskey(analysis)
+local parent=redis.call('HGET',ak,'record')
+local state=redis.call('HGET',ak,'state')
+if not parent then parent=redis.call('HGET',tk,'record'); state=redis.call('HGET',tk,'state') end
+if not parent or parent~=ARGV[9] or state~='completed' then return -1 end
+if redis.call('EXISTS',destination)==1 then
+    if redis.call('HGET',destination,'task_id')~=id
+        or redis.call('HGET',destination,'attempt_id')~=owner
+        or redis.call('HGET',destination,'record')~=ARGV[6]
+        or redis.call('HGET',destination,'evidence')~=ARGV[7] then return -2 end
+    return 0
+end
+if redis.call('LLEN',analyseskey(id))>=tonumber(ARGV[10]) then return -4 end
+local indexes=cjson.decode(ARGV[8])
+if not check_indexes(indexes) then return -3 end
+-- All preconditions and input decoding precede the first mutation.
+observe(id,owner)
+redis.call('HSET',destination,'task_id',id,'attempt_id',owner,'analysis_id',analysis,
+    'record',ARGV[6],'evidence',ARGV[7])
+redis.call('RPUSH',analyseskey(id),analysis)
+index_artifacts(indexes)
+journal(id,'analysis_completed',{analysis_id=analysis})
 return 1
 """
 )
@@ -854,6 +1329,9 @@ class RedisTaskStore:
                 "ensemble": _SUBMIT_ENSEMBLE,
                 "get_ensemble": _GET_ENSEMBLE,
                 "cancel_ensemble": _CANCEL_ENSEMBLE,
+                "archive": _GET_ARCHIVE,
+                "timeline": _TIMELINE,
+                "register_analysis": _REGISTER_ANALYSIS,
             }.items()
         }
 
@@ -866,11 +1344,14 @@ class RedisTaskStore:
         return self._scripts[name](args=[self._prefix, self._ttl_ms, *args])
 
     def submit(self, task_id: str, payload: dict[str, Any], carrier: dict[str, str]) -> None:
+        _identifier(task_id)
+        payload_raw = _archive_json(payload)
+        carrier_raw = _archive_json(carrier)
         code = self._call(
             "submit",
             task_id,
-            json.dumps(payload, allow_nan=False),
-            json.dumps(carrier),
+            payload_raw,
+            carrier_raw,
             self._capacity,
             _total(payload),
         )
@@ -895,16 +1376,33 @@ class RedisTaskStore:
     def heartbeat(self, job: Job) -> bool:
         return bool(self._call("heartbeat", job.task_id, job.owner, self._lease))
 
-    def finish(self, job: Job, result: dict[str, Any]) -> bool:
+    def finish(self, job: Job, result: dict[str, Any], *, evidence: dict | None = None) -> bool:
         record = _terminal_result(job.task_id, result)
-        return bool(
-            self._call(
-                "finish",
-                job.task_id,
-                job.owner,
-                record["status"],
-                json.dumps(record, allow_nan=False),
-            )
+        record_raw = _archive_json(record)
+        evidence_raw, locators = _evidence_records(job.task_id, job.owner, None, evidence)
+        if evidence is not None and record.get("attempt_id") != job.owner:
+            raise ValueError("Evidence must belong to the completed attempt")
+        code = self._call(
+            "finish",
+            job.task_id,
+            job.owner,
+            record["status"],
+            record_raw,
+            evidence_raw,
+            self._packed_indexes(locators),
+        )
+        if code == -2:
+            raise ValueError("Artifact identifier conflicts with an archived occurrence")
+        return bool(code)
+
+    @staticmethod
+    def _packed_indexes(locators: list[dict]) -> str:
+        return json.dumps(
+            [
+                {"artifact_id": locator["artifact_id"], "raw": _archive_json(locator)}
+                for locator in locators
+            ],
+            separators=(",", ":"),
         )
 
     def release(self, job: Job) -> bool:
@@ -944,15 +1442,15 @@ class RedisTaskStore:
     ) -> str:
         fingerprint, token = _ensemble_input(ensemble_id, children, metadata, idempotency_key)
         packed = [
-            {"id": child, "payload": json.dumps(payload, allow_nan=False), "total": _total(payload)}
+            {"id": child, "payload": _archive_json(payload), "total": _total(payload)}
             for child, payload in children
         ]
         row = self._call(
             "ensemble",
             ensemble_id,
             json.dumps(packed),
-            json.dumps(carrier),
-            json.dumps(metadata, allow_nan=False),
+            _archive_json(carrier),
+            _archive_json(metadata),
             self._capacity,
             token or "",
             fingerprint,
@@ -980,6 +1478,102 @@ class RedisTaskStore:
 
     def cancel_ensemble(self, ensemble_id: str) -> bool:
         return bool(self._call("cancel_ensemble", ensemble_id))
+
+    @staticmethod
+    def _analysis_archive(values: dict[str, str]) -> dict:
+        return {
+            "task_id": values["task_id"],
+            "attempt_id": values["attempt_id"],
+            "analysis_id": values["analysis_id"],
+            "record": json.loads(values["record"]),
+            "evidence": json.loads(values["evidence"]),
+        }
+
+    def get_task_archive(self, task_id: str) -> dict | None:
+        _identifier(task_id)
+        row = self._call("archive", task_id)
+        if not row:
+            return None
+        fields = dict(zip(row[0][::2], row[0][1::2], strict=True))
+        return {
+            "task_id": task_id,
+            "payload": json.loads(fields["payload"]),
+            "submitted_at": float(fields["submitted_at"]) if fields["submitted_at"] else None,
+            "ensemble_id": fields["ensemble_id"] or None,
+            "record": json.loads(fields["record"]),
+            "evidence": json.loads(fields["evidence"]) if fields.get("evidence") else None,
+            "attempts": [json.loads(item) for item in row[1]],
+            "analyses": [
+                self._analysis_archive(dict(zip(item[::2], item[1::2], strict=True)))
+                for item in row[2]
+            ],
+            "coverage": fields["coverage"],
+            "storage": "redis",
+            "last_event_id": row[3] or None,
+        }
+
+    def timeline(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
+        _identifier(task_id)
+        _timeline_cursor(after_id, limit)
+        rows = self._call("timeline", task_id, after_id or "", limit)
+        if rows is None:
+            return None
+        selected = rows[:limit]
+        return {
+            "task_id": task_id,
+            "events": [{"event_id": item[0], **json.loads(item[1][1])} for item in selected],
+            "next_cursor": selected[-1][0] if selected else None,
+            "has_more": len(rows) > limit,
+        }
+
+    def register_analysis(
+        self, task_id: str, attempt_id: str, analysis_id: str, record: dict, *, evidence: dict
+    ) -> None:
+        record_raw = _analysis_record(task_id, attempt_id, analysis_id, record)
+        evidence_raw, locators = _evidence_records(task_id, attempt_id, analysis_id, evidence)
+        self._ensure_open()
+        parent_raw = self._redis.hget(self._prefix + "archive:task:" + task_id, "record")
+        if parent_raw is None:
+            parent_raw = self._redis.hget(self._task_prefix + task_id, "record")
+        parent = json.loads(parent_raw) if parent_raw is not None else None
+        if (
+            parent is None
+            or parent.get("status") != "completed"
+            or parent.get("attempt_id") != attempt_id
+        ):
+            raise ValueError("Analysis requires the committed completed parent attempt")
+        code = self._call(
+            "register_analysis",
+            task_id,
+            attempt_id,
+            analysis_id,
+            record_raw,
+            evidence_raw,
+            self._packed_indexes(locators),
+            parent_raw,
+            MAX_ARCHIVED_ANALYSES,
+        )
+        if code == -1:
+            raise ValueError("Analysis requires the committed completed parent attempt")
+        if code == -2:
+            raise ValueError("Analysis identifier conflicts with an archived analysis")
+        if code == -3:
+            raise ValueError("Artifact identifier conflicts with an archived occurrence")
+        if code == -4:
+            raise ArchiveCapacityError("The task analysis archive capacity is exhausted")
+
+    def get_analysis_archive(self, analysis_id: str) -> dict | None:
+        _identifier(analysis_id)
+        self._ensure_open()
+        fields = self._redis.hgetall(self._prefix + "archive:analysis:" + analysis_id)
+        return self._analysis_archive(fields) if fields else None
+
+    def get_artifact_archive(self, artifact_id: str) -> dict | None:
+        if not isinstance(artifact_id, str) or not DIGEST.fullmatch(artifact_id):
+            raise ValueError("Invalid artifact identifier")
+        self._ensure_open()
+        raw = self._redis.get(self._prefix + "archive:artifact:" + artifact_id)
+        return json.loads(raw) if raw is not None else None
 
     def health(self) -> bool:
         return not self._closed and bool(self._redis.ping())
