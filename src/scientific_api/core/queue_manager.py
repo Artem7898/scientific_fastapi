@@ -11,11 +11,12 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from ..domain.experiments import parameters_from_payload
+from ..domain.experiments import ExperimentParameters, parameters_from_payload
 from ..domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
 from ..domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from ..domain.simulation import SimulationCancelled
 from ..models.lj_forces import NeighborCapacityError, PairBudgetExceeded, ParticleOverlapError
+from ..services.checkpoint_service import CheckpointControl, CheckpointError, load_checkpoint
 from ..services.provenance_evidence import build_archive_evidence
 from ..services.result_envelope_service import read_result_envelope
 from ..services.simulation_service import run_simulation
@@ -149,6 +150,55 @@ class QueueManager:
             cancelled.set()
             raise SimulationCancelled("Task lease is no longer current")
 
+    def _register_checkpoint(self, job: Job, cancelled: Event, descriptor: dict[str, Any]) -> None:
+        if self._stopping or cancelled.is_set() or self.backend.is_cancel_requested(job):
+            cancelled.set()
+            raise SimulationCancelled("Checkpoint publication interrupted")
+        try:
+            current = self.backend.register_checkpoint(job, descriptor)
+        except Exception as error:
+            # The remote write may have succeeded before its response was lost.
+            # Its complete immutable files must remain available to the archive.
+            code = getattr(error, "code", "CHECKPOINT_REGISTRATION_UNCONFIRMED")
+            raise CheckpointError(code) from error
+        if not current:
+            cancelled.set()
+            raise SimulationCancelled("Checkpoint lease is no longer current")
+
+    def _compute(
+        self, parameters: ExperimentParameters, job: Job, cancelled: Event
+    ) -> dict[str, Any]:
+        # Run compatibility checks on the actual scientific worker thread. API
+        # process hardware is not evidence of a remote worker's compatibility.
+        options: dict[str, Any] = {
+            "task_id": job.task_id,
+            "attempt_id": job.owner,
+            "artifacts_dir": Path(self.settings.artifacts_dir),
+            "tracker": self.tracker,
+            "cancel_event": cancelled,
+            "progress_callback": partial(self._report_progress, job, cancelled),
+        }
+        if job.checkpoint is not None or self.settings.checkpoint_interval_steps:
+            loaded = (
+                load_checkpoint(
+                    job.checkpoint,
+                    parameters=parameters,
+                    artifacts_dir=Path(self.settings.artifacts_dir),
+                )
+                if job.checkpoint is not None
+                else None
+            )
+            options["checkpoint_control"] = CheckpointControl(
+                parameters,
+                task_id=job.task_id,
+                attempt_id=job.owner,
+                artifacts_dir=Path(self.settings.artifacts_dir),
+                interval_steps=self.settings.checkpoint_interval_steps,
+                loaded=loaded,
+                register=partial(self._register_checkpoint, job, cancelled),
+            )
+        return run_simulation(parameters, **options)
+
     async def _execute(self, job: Job) -> None:
         cancelled = Event()
         self._events[job.owner] = cancelled
@@ -166,14 +216,10 @@ class QueueManager:
                 parameters = parameters_from_payload(job.payload)
                 context = contextvars.copy_context()
                 function = partial(
-                    run_simulation,
+                    self._compute,
                     parameters,
-                    task_id=job.task_id,
-                    attempt_id=job.owner,
-                    artifacts_dir=Path(self.settings.artifacts_dir),
-                    tracker=self.tracker,
-                    cancel_event=cancelled,
-                    progress_callback=partial(self._report_progress, job, cancelled),
+                    job,
+                    cancelled,
                 )
                 computation = asyncio.get_running_loop().run_in_executor(
                     self._executor, context.run, function
@@ -244,7 +290,9 @@ class QueueManager:
             raise
         except Exception as exc:
             logger.exception("Simulation %s failed", job.task_id)
-            if isinstance(exc, ParticleOverlapError):
+            if isinstance(exc, CheckpointError):
+                message = "Checkpoint continuation failed; inspect the machine-readable error code"
+            elif isinstance(exc, ParticleOverlapError):
                 message = "Particles approached within 0.5 sigma; reduce timestep or density"
             elif isinstance(exc, PairBudgetExceeded):
                 message = "LJ pair-work budget exhausted; reduce particles or steps"
@@ -255,10 +303,10 @@ class QueueManager:
             else:
                 message = "Simulation execution failed; inspect server logs"
             try:
-                await self._finish(
-                    job,
-                    {"task_id": job.task_id, "status": "failed", "error": message},
-                )
+                failure = {"task_id": job.task_id, "status": "failed", "error": message}
+                if isinstance(exc, CheckpointError):
+                    failure["error_code"] = exc.code
+                await self._finish(job, failure)
             except Exception:
                 logger.exception("Could not persist failed task; lease will expire")
         finally:

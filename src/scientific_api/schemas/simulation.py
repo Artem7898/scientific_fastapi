@@ -1,8 +1,17 @@
 """Strict, finite transport contracts for simulations in reduced units."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    SerializerFunctionWrapHandler,
+    StrictInt,
+    model_serializer,
+    model_validator,
+)
 
 from ..domain.simulation import ComputeBackend, SimulationParameters
 from .langevin import LangevinResponse
@@ -67,6 +76,14 @@ class TaskFailed(StrictModel):
     task_id: str
     status: Literal["failed", "cancelled"]
     error: str
+    error_code: str | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_failure(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        result = handler(self)
+        if self.error_code is None:
+            result.pop("error_code", None)
+        return result
 
 
 CompletedSimulationResponse = Annotated[

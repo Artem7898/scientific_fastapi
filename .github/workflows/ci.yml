@@ -154,6 +154,21 @@ jobs:
           else:
               raise AssertionError("Container task did not finish")
           assert result["task_id"] == accepted["task_id"]
+          checkpoint_url = base + "/api/v1/simulations/" + result["task_id"] + "/checkpoints"
+          with urllib.request.urlopen(checkpoint_url, timeout=5) as response:
+              checkpoints = json.load(response)
+          assert checkpoints["checkpoints"] == []
+          assert checkpoints["integrity_status"] == "recorded_not_rechecked"
+          resume = urllib.request.Request(
+              base + "/api/v1/simulations/" + result["task_id"] + "/resume",
+              data=b'{}', headers={"Content-Type": "application/json"},
+          )
+          try:
+              urllib.request.urlopen(resume, timeout=5)
+              raise AssertionError("A completed task was reopened through resume")
+          except urllib.error.HTTPError as error:
+              assert error.code == 409
+              assert json.load(error)["detail"]["code"] == "RESUME_STATE_CONFLICT"
           prefix = result["task_id"] + "/" + result["attempt_id"] + "/"
           assert all(path.startswith(prefix) for path in result["artifacts"].values())
           artifact = base + "/api/v1/simulations/" + accepted["task_id"] + "/artifacts/"
@@ -517,6 +532,7 @@ jobs:
           from scientific_api.domain.simulation import SimulationParameters
           from scientific_api.research.lj_analysis import analyze_lj_observables
           from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
+          from scientific_api.services.checkpoint_service import CheckpointControl, load_checkpoint
           from scientific_api.services.result_envelope_service import read_result_envelope
           from scientific_api.services.simulation_service import run_simulation
 
@@ -536,6 +552,59 @@ jobs:
                   (root / result["artifacts"]["manifest"]).read_bytes()
               ).hexdigest()
 
+          def verify_checkpoint_resume(parameters, reference, root):
+              registered = []
+
+              class InterruptedAfterCheckpoint(RuntimeError):
+                  pass
+
+              def register(descriptor):
+                  registered.append(descriptor)
+                  if descriptor["completed_steps"] > 0:
+                      raise InterruptedAfterCheckpoint
+                  return True
+
+              task_id = reference["task_id"] + "_checkpoint"
+              control = CheckpointControl(
+                  parameters, task_id=task_id, attempt_id="interrupted", artifacts_dir=root,
+                  interval_steps=1, register=register,
+              )
+              try:
+                  run_simulation(
+                      parameters, task_id=task_id, attempt_id="interrupted", artifacts_dir=root,
+                      checkpoint_control=control,
+                  )
+              except InterruptedAfterCheckpoint:
+                  pass
+              else:
+                  raise AssertionError("The controlled checkpoint interruption did not occur")
+              descriptor = registered[-1]
+              assert 0 < descriptor["completed_steps"] < parameters.num_steps
+              loaded = load_checkpoint(descriptor, parameters=parameters, artifacts_dir=root)
+              resumed_control = CheckpointControl(
+                  parameters, task_id=task_id, attempt_id="resumed", artifacts_dir=root,
+                  loaded=loaded,
+              )
+              resumed = run_simulation(
+                  parameters, task_id=task_id, attempt_id="resumed", artifacts_dir=root,
+                  checkpoint_control=resumed_control,
+              )
+              verify_envelope(resumed, root)
+              for name in reference.keys() - {"task_id", "attempt_id", "artifacts"}:
+                  assert resumed[name] == reference[name], name
+              for name, relative in reference["artifacts"].items():
+                  if name == "manifest":
+                      continue
+                  original_path = root / relative
+                  resumed_path = root / resumed["artifacts"][name]
+                  if original_path.suffix == ".npz":
+                      with np.load(original_path, allow_pickle=False) as original, np.load(resumed_path, allow_pickle=False) as continued:
+                          assert set(original.files) == set(continued.files)
+                          for array in original.files:
+                              np.testing.assert_array_equal(original[array], continued[array])
+                  else:
+                      assert json.loads(original_path.read_bytes()) == json.loads(resumed_path.read_bytes())
+
           with tempfile.TemporaryDirectory() as directory:
               root = Path(directory)
               for backend in ("numpy", "numba"):
@@ -549,6 +618,7 @@ jobs:
                   )
                   assert result["status"] == "completed"
                   verify_envelope(result, root)
+                  verify_checkpoint_resume(parameters, result, root)
                   state_path = root / result["artifacts"]["final_state"]
                   with np.load(state_path, allow_pickle=False) as state:
                       states[backend] = state["velocities"].copy()
@@ -574,6 +644,7 @@ jobs:
                   )
                   assert result["status"] == "completed" and result["model_version"] == "langevin-free-v1"
                   verify_envelope(result, root)
+                  verify_checkpoint_resume(parameters, result, root)
                   assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
                   with (root / result["artifacts"]["manifest"]).open() as stream:
                       manifest = json.load(stream)
@@ -636,6 +707,7 @@ jobs:
                   )
                   assert result["status"] == "completed" and result["model_version"] == "lennard-jones-2d-v1"
                   verify_envelope(result, root)
+                  verify_checkpoint_resume(parameters, result, root)
                   assert result["potential_energy"] < 0 and result["total_energy"] < 0
                   assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
                   with (root / result["artifacts"]["manifest"]).open() as stream:
@@ -695,7 +767,7 @@ jobs:
               assert execution["fastmath"] is False and execution["parallel"] is False
               assert execution["cache"] is False and execution["nogil"] is True
           assert not any(name.split(".", 1)[0] in {"jax", "jaxlib"} for name in sys.modules)
-          print("Optional Numba image executes OU/Langevin/LJ, verifies envelopes and reanalyzes CPU results")
+          print("Optional Numba image: OU/Langevin/LJ exact checkpoint continuation, envelopes and saved CPU results")
           PYTHON
 
   optional-benchmarks:

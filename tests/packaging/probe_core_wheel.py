@@ -36,6 +36,7 @@ def main() -> None:
     from scientific_api.research.lj_analysis import analyze_lj_observables
     from scientific_api.research.transport_analysis import analyze_transport, load_trajectory_state
     from scientific_api.services.analysis_service import create_velocity_analysis
+    from scientific_api.services.checkpoint_service import CheckpointControl, load_checkpoint
     from scientific_api.services.model_registry import (
         backend_availability,
         get_model_contract,
@@ -84,6 +85,77 @@ def main() -> None:
             == hashlib.sha256((root / result["artifacts"]["manifest"]).read_bytes()).hexdigest()
         )
 
+    def verify_checkpoint_resume(parameters, reference: dict, root: Path) -> None:
+        registered = []
+
+        class InterruptedAfterCheckpoint(RuntimeError):
+            pass
+
+        def register(descriptor: dict) -> bool:
+            registered.append(descriptor)
+            if descriptor["completed_steps"] > 0:
+                raise InterruptedAfterCheckpoint
+            return True
+
+        task_id = reference["task_id"] + "_checkpoint"
+        control = CheckpointControl(
+            parameters,
+            task_id=task_id,
+            attempt_id="interrupted",
+            artifacts_dir=root,
+            interval_steps=1,
+            register=register,
+        )
+        try:
+            run_simulation(
+                parameters,
+                task_id=task_id,
+                attempt_id="interrupted",
+                artifacts_dir=root,
+                checkpoint_control=control,
+            )
+        except InterruptedAfterCheckpoint:
+            pass
+        else:
+            raise AssertionError("The controlled checkpoint interruption did not occur")
+        descriptor = registered[-1]
+        assert 0 < descriptor["completed_steps"] < parameters.num_steps
+        loaded = load_checkpoint(descriptor, parameters=parameters, artifacts_dir=root)
+        resumed_control = CheckpointControl(
+            parameters,
+            task_id=task_id,
+            attempt_id="resumed",
+            artifacts_dir=root,
+            loaded=loaded,
+        )
+        resumed = run_simulation(
+            parameters,
+            task_id=task_id,
+            attempt_id="resumed",
+            artifacts_dir=root,
+            checkpoint_control=resumed_control,
+        )
+        verify_envelope(resumed, root)
+        for name in reference.keys() - {"task_id", "attempt_id", "artifacts"}:
+            assert resumed[name] == reference[name], name
+        for name, relative in reference["artifacts"].items():
+            if name == "manifest":
+                continue
+            original_path = root / relative
+            resumed_path = root / resumed["artifacts"][name]
+            if original_path.suffix == ".npz":
+                with (
+                    np.load(original_path, allow_pickle=False) as original,
+                    np.load(resumed_path, allow_pickle=False) as continued,
+                ):
+                    assert set(original.files) == set(continued.files)
+                    for array in original.files:
+                        np.testing.assert_array_equal(original[array], continued[array])
+            else:
+                assert json.loads(original_path.read_bytes()) == json.loads(
+                    resumed_path.read_bytes()
+                )
+
     require_backend("numpy")
     simulator = create_simulator(SimulationParameters(initial_temperature=1.0, num_particles=4))
     simulator.advance()
@@ -92,13 +164,15 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        ou_parameters = SimulationParameters(initial_temperature=1.0, num_particles=8, num_steps=3)
         ou_result = run_simulation(
-            SimulationParameters(initial_temperature=1.0, num_particles=8, num_steps=3),
+            ou_parameters,
             task_id="core_ou",
             attempt_id="wheel",
             artifacts_dir=root,
         )
         verify_envelope(ou_result, root)
+        verify_checkpoint_resume(ou_parameters, ou_result, root)
         analysis = create_velocity_analysis(ou_result, artifacts_dir=root, bins=4, formats=())
         analysis_envelope = read_result_envelope(
             ou_result, artifacts_dir=root, analysis_id=analysis["analysis_id"], require_present=True
@@ -115,6 +189,7 @@ def main() -> None:
         assert result["status"] == "completed"
         assert result["model_version"] == "langevin-free-v1"
         verify_envelope(result, root)
+        verify_checkpoint_resume(parameters, result, root)
         assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "transport"}
         manifest = json.loads((root / result["artifacts"]["manifest"]).read_text())
         assert manifest["model"]["version"] == "langevin-free-v1"
@@ -162,6 +237,7 @@ def main() -> None:
         assert result["status"] == "completed"
         assert result["model_version"] == "lennard-jones-2d-v1"
         verify_envelope(result, root)
+        verify_checkpoint_resume(parameters, result, root)
         assert result["potential_energy"] < 0 and result["total_energy"] < 0
         assert set(result["artifacts"]) == {"manifest", "final_state", "trajectory", "observables"}
         manifest = json.loads((root / result["artifacts"]["manifest"]).read_text())
@@ -327,7 +403,7 @@ def main() -> None:
     assert "scientific_api.models.langevin_numba" not in sys.modules
     assert "scientific_api.models.lj_numba" not in sys.modules
     print(
-        "Core-only wheel: models, envelopes, archived provenance after TTL and RO-Crate roundtrip"
+        "Core-only wheel: models, exact checkpoint continuation, envelopes, provenance and RO-Crate"
     )
 
 

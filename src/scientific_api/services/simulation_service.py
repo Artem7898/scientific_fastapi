@@ -1,5 +1,7 @@
 """Execute a scientific experiment and persist its reproducibility record."""
 
+from __future__ import annotations
+
 import hashlib
 import importlib.metadata
 import json
@@ -16,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,6 +28,9 @@ from ..domain.langevin import LangevinParameters
 from ..domain.lennard_jones import LennardJonesParameters
 from ..domain.simulation import MODEL_VERSION, SimulationCancelled, SimulationParameters
 from ..models.computation import create_simulator
+
+if TYPE_CHECKING:
+    from .checkpoint_service import CheckpointControl
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +147,7 @@ def run_simulation(
     tracker: ExperimentTracker | None = None,
     cancel_event: Event | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_control: CheckpointControl | None = None,
 ) -> dict[str, Any]:
     """Compute a seeded trajectory and an auditable terminal-state artifact.
 
@@ -163,6 +169,7 @@ def run_simulation(
             tracker=tracker,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
+            checkpoint_control=checkpoint_control,
         )
     if isinstance(parameters, LangevinParameters):
         from .langevin_service import run_langevin_simulation
@@ -175,6 +182,7 @@ def run_simulation(
             tracker=tracker,
             cancel_event=cancel_event,
             progress_callback=progress_callback,
+            checkpoint_control=checkpoint_control,
         )
     if not isinstance(parameters, SimulationParameters):
         raise TypeError("parameters must be SimulationParameters")
@@ -188,6 +196,10 @@ def run_simulation(
         )
     _check_cancelled(cancel_event)
     artifacts_dir = Path(artifacts_dir).resolve()
+    if checkpoint_control is not None:
+        checkpoint_control.validate_run(
+            parameters, task_id=task_id, attempt_id=attempt_id, artifacts_dir=artifacts_dir
+        )
     task_dir = artifacts_dir / task_id
     if task_dir.is_symlink():
         raise ValueError("Artifact directory must not be a symlink")
@@ -217,13 +229,36 @@ def run_simulation(
                     **({"attempt_id": attempt_id} if attempt_id is not None else {}),
                 }
             )
-        simulator = create_simulator(parameters)
+        loaded = checkpoint_control.loaded if checkpoint_control is not None else None
+        if loaded is None:
+            simulator = create_simulator(parameters)
+            start_step = 0
+            if checkpoint_control is not None:
+                checkpoint_control.save_if_due(0, simulator, samples={}, next_sample=0)
+        else:
+            from ..models.checkpoint_state import restore_simulator
+
+            if (
+                type(loaded.completed_steps) is not int
+                or not 0 <= loaded.completed_steps <= parameters.num_steps
+                or type(loaded.next_sample) is not int
+                or loaded.next_sample != 0
+                or loaded.samples
+            ):
+                raise ValueError("Invalid OU checkpoint sampling state")
+            simulator = restore_simulator(parameters, loaded.model_metadata, loaded.model_arrays)
+            start_step = loaded.completed_steps
+            loaded = None
+            assert checkpoint_control is not None
+            checkpoint_control.release_loaded()
         last_progress = monotonic()
         if progress_callback is not None:
-            progress_callback(0, parameters.num_steps, "computing")
-        for step in range(1, parameters.num_steps + 1):
+            progress_callback(start_step, parameters.num_steps, "computing")
+        for step in range(start_step + 1, parameters.num_steps + 1):
             _check_cancelled(cancel_event)
             simulator.advance()
+            if checkpoint_control is not None:
+                checkpoint_control.save_if_due(step, simulator, samples={}, next_sample=0)
             if progress_callback is not None:
                 now = monotonic()
                 if step == parameters.num_steps or now - last_progress >= 0.5:
@@ -314,6 +349,8 @@ def run_simulation(
                 }
             ],
         }
+        if checkpoint_control is not None:
+            manifest["continuation"] = checkpoint_control.manifest_metadata()
         _check_cancelled(cancel_event)
         _write_manifest(run_dir / "manifest.json", manifest)
         from .result_envelope_service import publish_result_envelope

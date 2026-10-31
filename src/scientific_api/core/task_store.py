@@ -17,8 +17,19 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 from uuid import uuid4
+
+from ..domain.checkpoint import (
+    MAX_CHECKPOINT_ARCHIVE_BYTES,
+    MAX_CHECKPOINT_METADATA_BYTES,
+    MAX_CHECKPOINT_TOTAL_BYTES,
+    MAX_CHECKPOINTS_PER_TASK,
+    checkpoint_model_version,
+    checkpoint_parameters_sha256,
+)
+from ..domain.experiments import parameters_from_payload
 
 EVENT_LIMIT = 256
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -27,6 +38,8 @@ DIGEST = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE_JSON_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
 MAX_ARCHIVED_ANALYSES = 256
+MAX_MANUAL_RESUMES = 32
+CHECKPOINT_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class QueueFull(Exception):
@@ -37,6 +50,14 @@ class ArchiveCapacityError(Exception):
     """A task has no room for another immutable analysis occurrence."""
 
 
+class CheckpointStoreError(ValueError):
+    """A bounded machine-readable checkpoint or resume refusal."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 @dataclass(frozen=True)
 class Job:
     task_id: str
@@ -44,6 +65,7 @@ class Job:
     carrier: dict[str, str]
     submitted_at: float
     owner: str
+    checkpoint: dict | None = None
 
 
 class TaskStore(Protocol):
@@ -61,6 +83,11 @@ class TaskStore(Protocol):
     ) -> None: ...
     def get_analysis_archive(self, analysis_id: str) -> dict | None: ...
     def get_artifact_archive(self, artifact_id: str) -> dict | None: ...
+    def register_checkpoint(self, job: Job, descriptor: dict) -> bool: ...
+    def get_checkpoint(self, task_id: str, checkpoint_id: str) -> dict | None: ...
+    def list_checkpoints(self, task_id: str) -> list[dict] | None: ...
+    def get_latest_checkpoint(self, task_id: str) -> dict | None: ...
+    def request_resume(self, task_id: str, checkpoint_id: str, carrier: dict) -> dict: ...
     def release(self, job: Job) -> bool: ...
     def report_progress(
         self, job: Job, completed_steps: int, total_steps: int, phase: str
@@ -100,6 +127,82 @@ def _archive_json(value: dict, maximum: int = MAX_ARCHIVE_JSON_BYTES) -> str:
     if len(raw.encode()) > maximum:
         raise ValueError("Archive record exceeds its size limit")
     return raw
+
+
+def _checkpoint_identity(task_id: str, checkpoint_id: str) -> None:
+    _identifier(task_id)
+    if not isinstance(checkpoint_id, str) or not CHECKPOINT_ID.fullmatch(checkpoint_id):
+        raise CheckpointStoreError("CHECKPOINT_DESCRIPTOR_INVALID")
+
+
+def _checkpoint_descriptor(job: Job, descriptor: dict, original_payload: dict) -> tuple[str, int]:
+    try:
+        raw = _archive_json(descriptor, MAX_CHECKPOINT_METADATA_BYTES)
+        if set(descriptor) != {
+            "schema_version",
+            "checkpoint_id",
+            "task_id",
+            "attempt_id",
+            "completed_steps",
+            "total_steps",
+            "model_version",
+            "parameters_sha256",
+            "fingerprint_sha256",
+            "manifest",
+            "state",
+            "created_at",
+        }:
+            raise ValueError("Invalid descriptor fields")
+        _checkpoint_identity(job.task_id, descriptor["checkpoint_id"])
+        if (
+            type(descriptor["schema_version"]) is not int
+            or descriptor["schema_version"] != 1
+            or descriptor["task_id"] != job.task_id
+            or descriptor["attempt_id"] != job.owner
+            or type(descriptor["completed_steps"]) is not int
+            or type(descriptor["total_steps"]) is not int
+            or not 0 <= descriptor["completed_steps"] <= descriptor["total_steps"] <= 10_000
+            or descriptor["total_steps"] <= 0
+            or any(
+                not isinstance(descriptor[name], str) or not DIGEST.fullmatch(descriptor[name])
+                for name in ("parameters_sha256", "fingerprint_sha256")
+            )
+            or not isinstance(descriptor["created_at"], str)
+            or datetime.fromisoformat(descriptor["created_at"]).tzinfo is None
+        ):
+            raise ValueError("Invalid descriptor values")
+        prefix = f"{job.task_id}/{job.owner}/checkpoints/{descriptor['checkpoint_id']}"
+        size = 0
+        for name, filename, maximum in (
+            ("manifest", "checkpoint.json", MAX_CHECKPOINT_METADATA_BYTES),
+            ("state", "state.npz", MAX_CHECKPOINT_ARCHIVE_BYTES),
+        ):
+            item = descriptor[name]
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"path", "sha256", "bytes"}
+                or item["path"] != f"{prefix}/{filename}"
+                or not isinstance(item["sha256"], str)
+                or not DIGEST.fullmatch(item["sha256"])
+                or type(item["bytes"]) is not int
+                or not 0 < item["bytes"] <= maximum
+            ):
+                raise ValueError("Invalid checkpoint artifact")
+            size += item["bytes"]
+        parameters = parameters_from_payload(original_payload)
+        if (
+            checkpoint_parameters_sha256(parameters) != descriptor["parameters_sha256"]
+            or checkpoint_parameters_sha256(parameters_from_payload(job.payload))
+            != descriptor["parameters_sha256"]
+            or checkpoint_model_version(parameters) != descriptor["model_version"]
+            or parameters.num_steps != descriptor["total_steps"]
+        ):
+            raise CheckpointStoreError("CHECKPOINT_PARAMETERS_MISMATCH")
+        return raw, size
+    except CheckpointStoreError:
+        raise
+    except (ValueError, TypeError, KeyError, OverflowError) as error:
+        raise CheckpointStoreError("CHECKPOINT_DESCRIPTOR_INVALID") from error
 
 
 def _timeline_cursor(after_id: str | None, limit: int) -> None:
@@ -281,6 +384,7 @@ class _Entry:
     phase: str = "pending"
     sequence: int = 0
     history: deque = field(default_factory=lambda: deque(maxlen=EVENT_LIMIT))
+    manual_checkpoint_id: str | None = None
 
 
 @dataclass
@@ -312,6 +416,8 @@ class MemoryTaskStore:
         self._analyses: dict[str, dict] = {}
         self._artifacts: dict[str, dict] = {}
         self._ensemble_archives: dict[str, dict] = {}
+        self._checkpoints: dict[str, dict[str, dict]] = {}
+        self._sse_sequences: dict[str, int] = {}
         self._ensembles: dict[str, _Ensemble] = {}
         self._idempotency: dict[str, tuple[str, str]] = {}
         self._pending: deque[str] = deque()
@@ -347,6 +453,7 @@ class MemoryTaskStore:
     def _emit(self, task_id: str, entry: _Entry, phase: str) -> None:
         entry.phase = phase
         entry.sequence += 1
+        self._sse_sequences[task_id] = entry.sequence
         entry.history.append(
             {"event_id": f"{entry.sequence}-0", "data": self._snapshot(task_id, entry)}
         )
@@ -526,7 +633,25 @@ class MemoryTaskStore:
                 archive["attempts"].append(
                     {"attempt_id": entry.owner, "attempt": previous + 1, "claimed_at": now}
                 )
+                checkpoints = self._checkpoints.get(task_id, {})
+                checkpoint = next(reversed(checkpoints.values())) if checkpoints else None
+                archive["selected_checkpoint"] = copy.deepcopy(checkpoint)
+                if checkpoint is not None:
+                    entry.completed_steps = checkpoint["completed_steps"]
+                    entry.total_steps = checkpoint["total_steps"]
                 self._journal(task_id, entry, "attempt_claimed", now)
+                if checkpoint is not None:
+                    self._journal(
+                        task_id,
+                        entry,
+                        "attempt_resumed",
+                        now,
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "parent_attempt_id": checkpoint["attempt_id"],
+                            "completed_steps": checkpoint["completed_steps"],
+                        },
+                    )
                 self._emit(task_id, entry, "running")
                 return Job(
                     task_id,
@@ -534,6 +659,7 @@ class MemoryTaskStore:
                     dict(entry.carrier),
                     entry.submitted_at,
                     entry.owner,
+                    copy.deepcopy(checkpoint),
                 )
             return None
 
@@ -756,6 +882,12 @@ class MemoryTaskStore:
             if archive is not None:
                 events = self._journals[task_id]
                 archive["last_event_id"] = events[-1]["event_id"] if events else None
+                archive["checkpoints"] = copy.deepcopy(
+                    list(self._checkpoints.get(task_id, {}).values())
+                )
+                archive.setdefault("selected_checkpoint", None)
+                archive.setdefault("resume_count", 0)
+                archive.setdefault("previous_outcomes", [])
             return archive
 
     def timeline(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
@@ -835,6 +967,141 @@ class MemoryTaskStore:
             self._ensure_open()
             return copy.deepcopy(self._artifacts.get(artifact_id))
 
+    def register_checkpoint(self, job: Job, descriptor: dict) -> bool:
+        with self._lock:
+            self._ensure_open()
+            now = _now()
+            entry = self._owned(job, now)
+            if entry is None or entry.cancel_requested:
+                return False
+            archive = self._archives.get(job.task_id)
+            original = archive["payload"] if archive is not None else entry.payload
+            _, size = _checkpoint_descriptor(job, descriptor, original)
+            checkpoints = self._checkpoints.get(job.task_id, {})
+            checkpoint_id = descriptor["checkpoint_id"]
+            previous = checkpoints.get(checkpoint_id)
+            if previous is not None:
+                if previous != descriptor:
+                    raise CheckpointStoreError("CHECKPOINT_CONFLICT")
+                return True
+            if (
+                checkpoints
+                and descriptor["completed_steps"]
+                <= next(reversed(checkpoints.values()))["completed_steps"]
+            ):
+                raise CheckpointStoreError("CHECKPOINT_STEP_CONFLICT")
+            total_bytes = sum(
+                item["manifest"]["bytes"] + item["state"]["bytes"] for item in checkpoints.values()
+            )
+            if (
+                len(checkpoints) >= MAX_CHECKPOINTS_PER_TASK
+                or total_bytes + size > MAX_CHECKPOINT_TOTAL_BYTES
+            ):
+                raise CheckpointStoreError("CHECKPOINT_LIMIT_EXCEEDED")
+            self._observe(job.task_id, entry, now)
+            self._checkpoints.setdefault(job.task_id, {})[checkpoint_id] = copy.deepcopy(descriptor)
+            self._journal(
+                job.task_id,
+                entry,
+                "checkpoint_created",
+                now,
+                {"checkpoint_id": checkpoint_id, "completed_steps": descriptor["completed_steps"]},
+            )
+            return True
+
+    def get_checkpoint(self, task_id: str, checkpoint_id: str) -> dict | None:
+        _checkpoint_identity(task_id, checkpoint_id)
+        with self._lock:
+            self._ensure_open()
+            return copy.deepcopy(self._checkpoints.get(task_id, {}).get(checkpoint_id))
+
+    def list_checkpoints(self, task_id: str) -> list[dict] | None:
+        _identifier(task_id)
+        with self._lock:
+            self._ensure_open()
+            if task_id not in self._archives:
+                return None
+            return copy.deepcopy(list(self._checkpoints.get(task_id, {}).values()))
+
+    def get_latest_checkpoint(self, task_id: str) -> dict | None:
+        checkpoints = self.list_checkpoints(task_id)
+        return checkpoints[-1] if checkpoints else None
+
+    def request_resume(self, task_id: str, checkpoint_id: str, carrier: dict) -> dict:
+        _checkpoint_identity(task_id, checkpoint_id)
+        _archive_json(carrier)
+        with self._lock:
+            self._ensure_open()
+            now = _now()
+            self._cleanup(now)
+            archive = self._archives.get(task_id)
+            if archive is None:
+                raise CheckpointStoreError("TASK_NOT_FOUND")
+            if archive["ensemble_id"] is not None:
+                raise CheckpointStoreError("RESUME_ENSEMBLE_UNSUPPORTED")
+            checkpoints = self._checkpoints.get(task_id, {})
+            checkpoint = checkpoints.get(checkpoint_id)
+            if checkpoint is None:
+                raise CheckpointStoreError("CHECKPOINT_NOT_FOUND")
+            current = self._entries.get(task_id)
+            if current is not None and current.record["status"] in {"pending", "running"}:
+                if current.manual_checkpoint_id != checkpoint_id:
+                    raise CheckpointStoreError("RESUME_STATE_CONFLICT")
+                return {
+                    "task_id": task_id,
+                    "status": current.record["status"],
+                    "checkpoint_id": checkpoint_id,
+                    "deduplicated": True,
+                }
+            if archive["record"]["status"] not in {"failed", "cancelled"}:
+                raise CheckpointStoreError("RESUME_STATE_CONFLICT")
+            if next(reversed(checkpoints)) != checkpoint_id:
+                raise CheckpointStoreError("CHECKPOINT_NOT_LATEST")
+            count = archive.get("resume_count", 0)
+            if count >= MAX_MANUAL_RESUMES:
+                raise CheckpointStoreError("RESUME_LIMIT_EXCEEDED")
+            if self._active >= self._capacity:
+                raise QueueFull("Pending and running task capacity has been reached")
+            previous = copy.deepcopy(archive["record"])
+            if current is None:
+                current = _Entry({}, {}, now, {}, sequence=self._sse_sequences.get(task_id, 0))
+                self._entries[task_id] = current
+            current.payload = copy.deepcopy(archive["payload"])
+            current.carrier = copy.deepcopy(carrier)
+            current.submitted_at = now
+            current.record = {"task_id": task_id, "status": "pending"}
+            current.attempts = 0
+            current.owner = None
+            current.lease_until = 0.0
+            current.expires_at = None
+            current.cancel_requested = False
+            current.completed_steps = checkpoint["completed_steps"]
+            current.total_steps = checkpoint["total_steps"]
+            current.manual_checkpoint_id = checkpoint_id
+            archive.setdefault("previous_outcomes", []).append(previous)
+            archive["resume_count"] = count + 1
+            archive["selected_checkpoint"] = copy.deepcopy(checkpoint)
+            self._active += 1
+            self._pending.append(task_id)
+            self._journal(
+                task_id,
+                current,
+                "resume_requested",
+                now,
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "parent_attempt_id": checkpoint["attempt_id"],
+                    "completed_steps": checkpoint["completed_steps"],
+                },
+            )
+            self._emit(task_id, current, "pending")
+            return {
+                "task_id": task_id,
+                "status": "pending",
+                "checkpoint_id": checkpoint_id,
+                "deduplicated": False,
+            }
+
     def health(self) -> bool:
         with self._lock:
             return not self._closed
@@ -864,6 +1131,9 @@ local function attemptskey(id) return prefix..'archive:attempts:'..id end
 local function analyseskey(id) return prefix..'archive:analyses:'..id end
 local function analysiskey(id) return prefix..'archive:analysis:'..id end
 local function artifactkey(id) return prefix..'archive:artifact:'..id end
+local function checkpointskey(id) return prefix..'archive:checkpoints:'..id end
+local function checkpointkey(id,checkpoint) return prefix..'archive:checkpoint:'..id..':'..checkpoint end
+local function outcomeskey(id) return prefix..'archive:previous-outcomes:'..id end
 local function journal(id,event_type,details)
     local ak=archivekey(id)
     local state=redis.call('HGET',taskkey(id),'state') or redis.call('HGET',ak,'state')
@@ -1034,6 +1304,12 @@ while true do
     local key=taskkey(id)
     if redis.call('HGET',key,'state')=='pending' then
         observe(id)
+        local checkpoint=redis.call('LINDEX',checkpointskey(id),-1)
+        local checkpoint_raw=false
+        if checkpoint then
+            checkpoint_raw=redis.call('HGET',checkpointkey(id,checkpoint),'raw')
+            if not checkpoint_raw then return redis.error_reply('CHECKPOINT_REGISTRY_INVALID') end
+        end
         redis.call('HINCRBY',key,'attempts',1)
         redis.call('HSET',key,'state','running','owner',ARGV[3],
             'lease_until',tostring(now+tonumber(ARGV[4])),
@@ -1045,10 +1321,19 @@ while true do
         redis.call('RPUSH',attemptskey(id),cjson.encode({attempt_id=ARGV[3],attempt=count,
             claimed_at=now}))
         journal(id,'attempt_claimed')
+        if checkpoint then
+            local ck=checkpointkey(id,checkpoint)
+            redis.call('HSET',ak,'selected_checkpoint_id',checkpoint)
+            redis.call('HSET',key,'completed_steps',redis.call('HGET',ck,'completed_steps'),
+                'total_steps',redis.call('HGET',ck,'total_steps'))
+            journal(id,'attempt_resumed',{checkpoint_id=checkpoint,
+                parent_attempt_id=redis.call('HGET',ck,'attempt_id'),
+                completed_steps=tonumber(redis.call('HGET',ck,'completed_steps'))})
+        end
         redis.call('ZADD',running,now+tonumber(ARGV[4]),id)
         emit(id,'running')
         return {id,redis.call('HGET',key,'payload'),redis.call('HGET',key,'carrier'),
-            redis.call('HGET',key,'submitted_at'),ARGV[3]}
+            redis.call('HGET',key,'submitted_at'),ARGV[3],checkpoint_raw}
     elseif redis.call('EXISTS',key)==0 then redis.call('SREM',active,id) end
 end
 """
@@ -1233,8 +1518,12 @@ for _,analysis in ipairs(redis.call('LRANGE',analyseskey(id),0,-1)) do
     analyses[#analyses+1]=redis.call('HGETALL',analysiskey(analysis))
 end
 local latest=redis.call('XREVRANGE',journalkey(id),'+','-','COUNT',1)
+local checkpoints={}
+for _,checkpoint in ipairs(redis.call('LRANGE',checkpointskey(id),0,-1)) do
+    checkpoints[#checkpoints+1]=redis.call('HGET',checkpointkey(id,checkpoint),'raw')
+end
 return {redis.call('HGETALL',archivekey(id)),redis.call('LRANGE',attemptskey(id),0,-1),analyses,
-    #latest>0 and latest[1][1] or false}
+    #latest>0 and latest[1][1] or false,checkpoints,redis.call('LRANGE',outcomeskey(id),0,-1)}
 """
 )
 _TIMELINE = (
@@ -1274,6 +1563,93 @@ redis.call('RPUSH',analyseskey(id),analysis)
 index_artifacts(indexes)
 journal(id,'analysis_completed',{analysis_id=analysis})
 return 1
+"""
+)
+
+_GET_CHECKPOINTS = (
+    _LUA
+    + r"""
+local id=ARGV[3]
+if redis.call('EXISTS',archivekey(id))==0 then return nil end
+local checkpoints={}
+for _,checkpoint in ipairs(redis.call('LRANGE',checkpointskey(id),0,-1)) do
+    checkpoints[#checkpoints+1]=redis.call('HGET',checkpointkey(id,checkpoint),'raw')
+end
+return checkpoints
+"""
+)
+_REGISTER_CHECKPOINT = (
+    _LUA
+    + r"""
+local id=ARGV[3]; local checkpoint=ARGV[5]; local tk=taskkey(id); local ak=archivekey(id)
+if not owned(id,ARGV[4]) or redis.call('HGET',tk,'cancel_requested')=='1' then return 0 end
+local payload=redis.call('HGET',ak,'payload') or redis.call('HGET',tk,'payload')
+if payload~=ARGV[10] then return -7 end
+local ck=checkpointkey(id,checkpoint)
+local previous=redis.call('HGET',ck,'raw')
+if previous then
+    if previous==ARGV[6] then return 1 else return -2 end
+end
+local latest=redis.call('LINDEX',checkpointskey(id),-1)
+if latest and tonumber(redis.call('HGET',checkpointkey(id,latest),'completed_steps'))>=tonumber(ARGV[7]) then
+    return -3
+end
+if redis.call('LLEN',checkpointskey(id))>=tonumber(ARGV[11])
+    or tonumber(redis.call('HGET',ak,'checkpoint_bytes') or '0')+tonumber(ARGV[9])>tonumber(ARGV[12]) then
+    return -4
+end
+observe(id)
+redis.call('HSET',ck,'raw',ARGV[6],'completed_steps',ARGV[7],'total_steps',ARGV[8],
+    'attempt_id',ARGV[4])
+redis.call('RPUSH',checkpointskey(id),checkpoint)
+redis.call('HINCRBY',ak,'checkpoint_bytes',ARGV[9])
+journal(id,'checkpoint_created',{checkpoint_id=checkpoint,completed_steps=tonumber(ARGV[7])})
+return 1
+"""
+)
+_REQUEST_RESUME = (
+    _LUA
+    + r"""
+local id=ARGV[3]; local checkpoint=ARGV[4]; local ak=archivekey(id); local tk=taskkey(id)
+if redis.call('EXISTS',ak)==0 then return {-1} end
+if (redis.call('HGET',ak,'ensemble_id') or '')~='' then return {-3} end
+local ck=checkpointkey(id,checkpoint)
+if not redis.call('HGET',ck,'raw') then return {-2} end
+local current=redis.call('HGET',tk,'state')
+if current=='pending' or current=='running' then
+    if redis.call('HGET',tk,'manual_checkpoint_id')~=checkpoint then return {-4} end
+    return {0,current}
+end
+local state=redis.call('HGET',ak,'state')
+if state~='failed' and state~='cancelled' then return {-4} end
+if redis.call('LINDEX',checkpointskey(id),-1)~=checkpoint then return {-5} end
+if tonumber(redis.call('HGET',ak,'resume_count') or '0')>=tonumber(ARGV[7]) then return {-6} end
+if redis.call('SCARD',active)>=tonumber(ARGV[6]) then return {-7} end
+local previous=redis.call('HGET',ak,'record')
+local payload=redis.call('HGET',ak,'payload')
+if not previous or not payload then return {-4} end
+-- No payload or terminal result is decoded/re-encoded by Lua.
+redis.call('RPUSH',outcomeskey(id),previous)
+redis.call('HINCRBY',ak,'resume_count',1)
+redis.call('HSET',ak,'selected_checkpoint_id',checkpoint)
+local record=cjson.encode({task_id=id,status='pending'})
+redis.call('HSET',tk,'state','pending','record',record,'payload',payload,'carrier',ARGV[5],
+    'submitted_at',tostring(now),'attempts',0,'manual_checkpoint_id',checkpoint,
+    'completed_steps',redis.call('HGET',ck,'completed_steps'),
+    'total_steps',redis.call('HGET',ck,'total_steps'))
+redis.call('HDEL',tk,'owner','lease_until','cancel_requested')
+redis.call('PERSIST',tk)
+redis.call('PERSIST',streamkey(id))
+redis.call('HSET',ak,'record',record)
+redis.call('SADD',active,id)
+redis.call('ZREM',running,id)
+redis.call('LREM',pending,0,id)
+redis.call('RPUSH',pending,id)
+journal(id,'resume_requested',{checkpoint_id=checkpoint,
+    parent_attempt_id=redis.call('HGET',ck,'attempt_id'),
+    completed_steps=tonumber(redis.call('HGET',ck,'completed_steps'))})
+emit(id,'pending')
+return {1,'pending'}
 """
 )
 
@@ -1332,6 +1708,9 @@ class RedisTaskStore:
                 "archive": _GET_ARCHIVE,
                 "timeline": _TIMELINE,
                 "register_analysis": _REGISTER_ANALYSIS,
+                "get_checkpoints": _GET_CHECKPOINTS,
+                "register_checkpoint": _REGISTER_CHECKPOINT,
+                "request_resume": _REQUEST_RESUME,
             }.items()
         }
 
@@ -1368,7 +1747,14 @@ class RedisTaskStore:
     def claim(self) -> Job | None:
         row = self._call("claim", str(uuid4()), self._lease, self._max_attempts)
         return (
-            Job(row[0], json.loads(row[1]), json.loads(row[2]), float(row[3]), row[4])
+            Job(
+                row[0],
+                json.loads(row[1]),
+                json.loads(row[2]),
+                float(row[3]),
+                row[4],
+                json.loads(row[5]) if row[5] is not None else None,
+            )
             if row
             else None
         )
@@ -1495,6 +1881,7 @@ class RedisTaskStore:
         if not row:
             return None
         fields = dict(zip(row[0][::2], row[0][1::2], strict=True))
+        checkpoints = [json.loads(item) for item in row[4]]
         return {
             "task_id": task_id,
             "payload": json.loads(fields["payload"]),
@@ -1510,6 +1897,17 @@ class RedisTaskStore:
             "coverage": fields["coverage"],
             "storage": "redis",
             "last_event_id": row[3] or None,
+            "checkpoints": checkpoints,
+            "selected_checkpoint": next(
+                (
+                    item
+                    for item in checkpoints
+                    if item["checkpoint_id"] == fields.get("selected_checkpoint_id")
+                ),
+                None,
+            ),
+            "resume_count": int(fields.get("resume_count", "0")),
+            "previous_outcomes": [json.loads(item) for item in row[5]],
         }
 
     def timeline(self, task_id: str, after_id: str | None = None, limit: int = 100) -> dict | None:
@@ -1574,6 +1972,83 @@ class RedisTaskStore:
         self._ensure_open()
         raw = self._redis.get(self._prefix + "archive:artifact:" + artifact_id)
         return json.loads(raw) if raw is not None else None
+
+    def register_checkpoint(self, job: Job, descriptor: dict) -> bool:
+        self._ensure_open()
+        original_raw = self._redis.hget(self._prefix + "archive:task:" + job.task_id, "payload")
+        if original_raw is None:
+            original_raw = self._redis.hget(self._task_prefix + job.task_id, "payload")
+        if original_raw is None:
+            return False
+        raw, size = _checkpoint_descriptor(job, descriptor, json.loads(original_raw))
+        code = self._call(
+            "register_checkpoint",
+            job.task_id,
+            job.owner,
+            descriptor["checkpoint_id"],
+            raw,
+            descriptor["completed_steps"],
+            descriptor["total_steps"],
+            size,
+            original_raw,
+            MAX_CHECKPOINTS_PER_TASK,
+            MAX_CHECKPOINT_TOTAL_BYTES,
+        )
+        errors = {
+            -2: "CHECKPOINT_CONFLICT",
+            -3: "CHECKPOINT_STEP_CONFLICT",
+            -4: "CHECKPOINT_LIMIT_EXCEEDED",
+            -7: "CHECKPOINT_PARAMETERS_MISMATCH",
+        }
+        if code in errors:
+            raise CheckpointStoreError(errors[code])
+        return bool(code)
+
+    def get_checkpoint(self, task_id: str, checkpoint_id: str) -> dict | None:
+        _checkpoint_identity(task_id, checkpoint_id)
+        self._ensure_open()
+        raw = self._redis.hget(
+            self._prefix + f"archive:checkpoint:{task_id}:{checkpoint_id}", "raw"
+        )
+        return json.loads(raw) if raw is not None else None
+
+    def list_checkpoints(self, task_id: str) -> list[dict] | None:
+        _identifier(task_id)
+        rows = self._call("get_checkpoints", task_id)
+        return [json.loads(item) for item in rows] if rows is not None else None
+
+    def get_latest_checkpoint(self, task_id: str) -> dict | None:
+        checkpoints = self.list_checkpoints(task_id)
+        return checkpoints[-1] if checkpoints else None
+
+    def request_resume(self, task_id: str, checkpoint_id: str, carrier: dict) -> dict:
+        _checkpoint_identity(task_id, checkpoint_id)
+        row = self._call(
+            "request_resume",
+            task_id,
+            checkpoint_id,
+            _archive_json(carrier),
+            self._capacity,
+            MAX_MANUAL_RESUMES,
+        )
+        errors = {
+            -1: "TASK_NOT_FOUND",
+            -2: "CHECKPOINT_NOT_FOUND",
+            -3: "RESUME_ENSEMBLE_UNSUPPORTED",
+            -4: "RESUME_STATE_CONFLICT",
+            -5: "CHECKPOINT_NOT_LATEST",
+            -6: "RESUME_LIMIT_EXCEEDED",
+        }
+        if row[0] in errors:
+            raise CheckpointStoreError(errors[row[0]])
+        if row[0] == -7:
+            raise QueueFull("Pending and running task capacity has been reached")
+        return {
+            "task_id": task_id,
+            "status": row[1],
+            "checkpoint_id": checkpoint_id,
+            "deduplicated": row[0] == 0,
+        }
 
     def health(self) -> bool:
         return not self._closed and bool(self._redis.ping())

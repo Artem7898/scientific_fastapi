@@ -351,6 +351,7 @@ def _simulation(
         rng=rng,
         environment=_object(manifest.get("environment", {} if historical else None)),
         diagnostics=diagnostics,
+        continuation=manifest.get("continuation"),
         units=parsed.units,
         uncertainty=(
             EnvelopeUncertainty(

@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import __version__
 from .adapters.mlflow_adapter import build_tracker
 from .api.v1.endpoints.analyses import router as analysis_router
+from .api.v1.endpoints.checkpoints import router as checkpoint_router
 from .api.v1.endpoints.ensembles import router as ensemble_router
 from .api.v1.endpoints.events import router as event_router
 from .api.v1.endpoints.models import router as model_router
@@ -180,6 +181,7 @@ def create_app(
     application.include_router(model_router, prefix="/api/v1")
     application.include_router(envelope_router, prefix="/api/v1")
     application.include_router(provenance_router, prefix="/api/v1")
+    application.include_router(checkpoint_router, prefix="/api/v1")
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:

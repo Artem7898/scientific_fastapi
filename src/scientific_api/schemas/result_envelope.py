@@ -91,6 +91,7 @@ class ResultEnvelope(StrictModel):
     units: dict[str, str] = Field(default_factory=dict)
     uncertainty: EnvelopeUncertainty
     source: dict[str, Any] | None = None
+    continuation: dict[str, Any] | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod

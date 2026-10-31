@@ -1,5 +1,7 @@
 """Execute and persist a position-aware, driven Langevin experiment."""
 
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -12,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -27,6 +29,9 @@ from .simulation_service import (
     _sha256,
     _write_manifest,
 )
+
+if TYPE_CHECKING:
+    from .checkpoint_service import CheckpointControl, LoadedCheckpoint
 
 logger = logging.getLogger(__name__)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -87,6 +92,50 @@ def _array_record(path: Path, root: Path, arrays: dict[str, np.ndarray]) -> dict
     }
 
 
+def _restore_sample_prefix(
+    loaded: LoadedCheckpoint,
+    sample_steps: np.ndarray,
+    trajectory: np.ndarray,
+    num_steps: int,
+    *,
+    series: dict[str, np.ndarray] | None = None,
+) -> int:
+    """Restore only initialized samples, preserving the original global schedule."""
+    step = loaded.completed_steps
+    if type(step) is not int or not 0 <= step <= num_steps:
+        raise ValueError("Checkpoint step is outside the original simulation")
+    next_sample = int(np.searchsorted(sample_steps, step, side="right"))
+    expected_names = {"trajectory", *(series or {})}
+    if (
+        type(loaded.next_sample) is not int
+        or loaded.next_sample != next_sample
+        or set(loaded.samples) != expected_names
+    ):
+        raise ValueError("Checkpoint sampling cursor does not match its global schedule")
+    prefix = loaded.samples["trajectory"]
+    if (
+        not isinstance(prefix, np.ndarray)
+        or prefix.dtype != np.dtype(np.float64)
+        or prefix.shape != (next_sample, *trajectory.shape[1:])
+        or not prefix.flags.c_contiguous
+        or not np.isfinite(prefix).all()
+    ):
+        raise ValueError("Checkpoint trajectory prefix is invalid")
+    trajectory[:next_sample] = prefix
+    for name, values in (series or {}).items():
+        saved = loaded.samples[name]
+        if (
+            not isinstance(saved, np.ndarray)
+            or saved.dtype != np.dtype(np.float64)
+            or saved.shape != (next_sample,)
+            or not saved.flags.c_contiguous
+            or not np.isfinite(saved).all()
+        ):
+            raise ValueError("Checkpoint observable prefix is invalid")
+        values[:next_sample] = saved
+    return next_sample
+
+
 def run_langevin_simulation(
     parameters: LangevinParameters,
     *,
@@ -96,6 +145,7 @@ def run_langevin_simulation(
     tracker: ExperimentTracker | None = None,
     cancel_event: Event | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    checkpoint_control: CheckpointControl | None = None,
 ) -> dict[str, Any]:
     """Persist terminal state, sampled unwrapped coordinates and transport data.
 
@@ -107,6 +157,10 @@ def run_langevin_simulation(
         raise TypeError("parameters must be LangevinParameters")
     _check_cancelled(cancel_event)
     root = Path(artifacts_dir).resolve()
+    if checkpoint_control is not None:
+        checkpoint_control.validate_run(
+            parameters, task_id=task_id, attempt_id=attempt_id, artifacts_dir=root
+        )
     run_dir = _run_directory(root, task_id, attempt_id)
     sample_steps = np.asarray(parameters.sampling_steps(), dtype=np.int64)
     times = sample_steps.astype(np.float64) * parameters.time_step
@@ -124,19 +178,47 @@ def run_langevin_simulation(
                     **({"attempt_id": attempt_id} if attempt_id is not None else {}),
                 }
             )
-        simulator = create_langevin_simulator(parameters)
+        loaded = checkpoint_control.loaded if checkpoint_control is not None else None
+        if loaded is None:
+            simulator = create_langevin_simulator(parameters)
         trajectory = np.empty((len(sample_steps), parameters.num_particles, 2), dtype=np.float64)
-        trajectory[0] = simulator.unwrapped_positions
-        next_sample = 1
+        if loaded is None:
+            trajectory[0] = simulator.unwrapped_positions
+            start_step, next_sample = 0, 1
+            if checkpoint_control is not None:
+                checkpoint_control.save_if_due(
+                    0,
+                    simulator,
+                    samples={"trajectory": trajectory[:next_sample]},
+                    next_sample=next_sample,
+                )
+        else:
+            from ..models.checkpoint_state import restore_simulator
+
+            next_sample = _restore_sample_prefix(
+                loaded, sample_steps, trajectory, parameters.num_steps
+            )
+            simulator = restore_simulator(parameters, loaded.model_metadata, loaded.model_arrays)
+            start_step = loaded.completed_steps
+            loaded = None
+            assert checkpoint_control is not None
+            checkpoint_control.release_loaded()
         last_progress = monotonic()
         if progress_callback is not None:
-            progress_callback(0, parameters.num_steps, "computing")
-        for step in range(1, parameters.num_steps + 1):
+            progress_callback(start_step, parameters.num_steps, "computing")
+        for step in range(start_step + 1, parameters.num_steps + 1):
             _check_cancelled(cancel_event)
             simulator.advance()
             if next_sample < len(sample_steps) and step == sample_steps[next_sample]:
                 trajectory[next_sample] = simulator.unwrapped_positions
                 next_sample += 1
+            if checkpoint_control is not None:
+                checkpoint_control.save_if_due(
+                    step,
+                    simulator,
+                    samples={"trajectory": trajectory[:next_sample]},
+                    next_sample=next_sample,
+                )
             if progress_callback is not None:
                 now = monotonic()
                 if step == parameters.num_steps or now - last_progress >= 0.5:
@@ -306,6 +388,8 @@ def run_langevin_simulation(
                 },
             ],
         }
+        if checkpoint_control is not None:
+            manifest["continuation"] = checkpoint_control.manifest_metadata()
         _check_cancelled(cancel_event)
         _write_manifest(run_dir / "manifest.json", manifest)
         from .result_envelope_service import publish_result_envelope
