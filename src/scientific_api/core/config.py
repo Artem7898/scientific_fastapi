@@ -13,7 +13,9 @@ class Settings(BaseSettings):
 
     app_name: str = "Scientific API"
     debug: bool = False
-    execution_mode: Literal["embedded", "api", "worker", "verification-worker"] = "embedded"
+    execution_mode: Literal[
+        "embedded", "api", "worker", "verification-worker", "research-worker"
+    ] = "embedded"
     artifacts_dir: Path = Path("artifacts/runs")
     max_simulation_iterations: int = Field(default=10_000, ge=1, le=10_000)
     max_particle_steps: int = Field(default=100_000_000, ge=1, le=100_000_000)
@@ -21,6 +23,8 @@ class Settings(BaseSettings):
     worker_count: int = Field(default=2, ge=1, le=32)
     analysis_worker_count: int = Field(default=2, ge=1, le=8)
     verification_worker_count: int = Field(default=1, ge=1, le=8)
+    research_worker_count: int = Field(default=1, ge=1, le=4)
+    max_research_queue_size: int = Field(default=16, ge=1, le=10_000)
     max_verification_queue_size: int = Field(default=32, ge=1, le=10_000)
     verification_rerun_max_particle_steps: int = Field(default=1_000_000, ge=1, le=100_000_000)
     verification_rerun_max_lj_pair_checks: int = Field(default=5_000_000, ge=1, le=100_000_000)

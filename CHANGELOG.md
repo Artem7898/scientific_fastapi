@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a separate bounded research-analysis queue and research-worker role for immutable, SHA256-linked LJ uncertainty reports from archived saved results.
+- Estimate IAT/ESS and dependent uncertainty with conditional long-batch Student-t intervals; retain moving-block bootstrap as secondary exploratory evidence and report explicit stationarity, sampling and mixing limits.
+- Analyze matched independent whole-trajectory replicas with approximate Student-t intervals, and matched-seed one-parameter sensitivity as descriptive changes rather than convergence proof.
+- Preserve source simulation results, snapshot uncertainty declarations, provenance exports and existing velocity-analysis/verification contracts; keep NumPy-only computation in the lightweight core.
 - Add an independent bounded leased verification queue and dedicated verification workers for archived completed results, without rewriting source results, envelopes or provenance exports.
 - Verify source integrity and independently recompute supported observables/invariants for the three models; allow an explicitly requested, resource-bounded same-seed rerun.
 - Publish durable unsigned canonical JSON certificates with checks, honest verdicts and integrity digests; distinguish job completion from scientific verification outcomes.

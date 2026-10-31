@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "registered_at_utc": "2026-10-31T16:10:45.032871+00:00",
+  "role": "Fixed holdout design written before evaluating the redesigned primary interval",
+  "seed_label": "scientific-api-phase10-holdout-v1",
+  "seed_label_sha256": "278ac2edc82ef18b1f98712ada68629349c680334859c3e21837e8f881578c55",
+  "seed_derivation": "First 16 SHA256 bytes interpreted as a little-endian unsigned integer; exact entropy stored as decimal string",
+  "seed_entropy_decimal": "195907487127992951719556613343616862759",
+  "stream_plan": "SeedSequence(entropy).spawn(4), one case in listed phi order; case.spawn(160); each trial.spawn(2) supplies separate PCG64 noise and uint64 bootstrap-seed streams",
+  "cases": [
+    {
+      "phi": 0.0,
+      "samples": 1001,
+      "independent_trials": 160
+    },
+    {
+      "phi": 0.3,
+      "samples": 1001,
+      "independent_trials": 160
+    },
+    {
+      "phi": 0.6,
+      "samples": 1001,
+      "independent_trials": 160
+    },
+    {
+      "phi": 0.8,
+      "samples": 1001,
+      "independent_trials": 160
+    }
+  ],
+  "data_generation": {
+    "initial_distribution": "Normal(0,1)",
+    "recurrence": "x[t]=phi*x[t-1]+sqrt(1-phi**2)*Normal(0,1)",
+    "true_mean": 0.0,
+    "true_marginal_variance": 1.0,
+    "inputs_are_LJ_simulations": false
+  },
+  "analysis_options": {
+    "assume_stationary": true,
+    "confidence_level": 0.95,
+    "bootstrap_samples": 1000,
+    "block_length": null,
+    "observable_names": [
+      "pressure"
+    ],
+    "meaning_of_pressure": "Synthetic scalar channel for statistical-method calibration only"
+  },
+  "planned_outputs": [
+    "Primary batch-means Student-t interval: eligibility, hits/count, conditional coverage and 95% Wilson interval per case",
+    "Secondary exploratory moving-block percentile interval: same measures per case",
+    "All unavailability reasons and reported-and-covering fraction of all trials",
+    "Recorded exact implementation digest and unchanged original MBB baseline"
+  ],
+  "limitations": [
+    "One finite Gaussian dependence family does not prove coverage for molecular dynamics or all stationary processes",
+    "Coverage among reported intervals conditions on diagnostic gates; eligibility is always shown",
+    "Wilson bounds are per estimate, without simultaneous multiple-case coverage claims",
+    "Cases, streams, sample counts and options are fixed before redesigned-method scores; any score-driven method tuning must be disclosed and these results relabeled exploratory"
+  ]
+}
