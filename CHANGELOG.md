@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add versioned model contracts and a JSON Schema catalog for the three scientific models, with explicit units, assumptions, invariants, diagnostics, backend semantics and artifact requirements.
+- Publish a typed Result Envelope after each new successful simulation and saved-velocity analysis; retain existing status responses and manifest outputs.
+- Verify manifest bytes, artifact checksums and contract bindings when reading envelopes; distinguish unavailable historical evidence from integrity conflicts without claiming authenticity or independent scientific validation.
+- Exercise model catalogs and envelopes in core-only wheel and container checks without importing optional computing or plotting libraries.
 - Add the periodic `lennard-jones-2d-v1` model with shifted-force interactions, NVE velocity Verlet and NVT BAOAB, while preserving the earlier OU and free-Langevin contracts.
 - Validate direct forces against cell-built Verlet neighbor lists and optional Numba, with unwrapped displacement rebuilds and explicit pair-work/trajectory budgets.
 - Persist signed energies, pressure, sampled trajectories, a finite-N 2D radial distribution, and model-specific provenance; keep correlated-frame summaries separate from independent-replica uncertainty.

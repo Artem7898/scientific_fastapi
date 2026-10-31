@@ -16,6 +16,7 @@ from ..domain.langevin import LANGEVIN_MODEL_VERSION, LangevinParameters
 from ..domain.lennard_jones import LJ_MODEL_VERSION, LennardJonesParameters
 from ..domain.simulation import SimulationCancelled
 from ..models.lj_forces import NeighborCapacityError, PairBudgetExceeded, ParticleOverlapError
+from ..services.result_envelope_service import read_result_envelope
 from ..services.simulation_service import run_simulation
 from .config import Settings
 from .experiment_tracker import ExperimentTracker
@@ -199,8 +200,21 @@ class QueueManager:
                     and result.get("model_version") != LJ_MODEL_VERSION
                 ):
                     raise ValueError("Scientific result has the wrong model version")
-                if result.get("task_id") != job.task_id or result.get("status") != "completed":
+                if (
+                    result.get("task_id") != job.task_id
+                    or result.get("attempt_id") != job.owner
+                    or result.get("status") != "completed"
+                ):
                     raise ValueError("Scientific result violates the task contract")
+                # Admission of a successful new result requires the exact
+                # manifest and artifacts verified after computation/tracking.
+                # The task store still fences this commit with the lease owner.
+                await asyncio.to_thread(
+                    read_result_envelope,
+                    result,
+                    artifacts_dir=Path(self.settings.artifacts_dir),
+                    require_present=True,
+                )
                 committed = await self._finish(job, result)
                 if not committed:
                     logger.warning("Discarded result from an obsolete task lease")

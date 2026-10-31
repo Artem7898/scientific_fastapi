@@ -154,6 +154,22 @@ For interacting particles, set `"model":"lennard-jones-2d-v1"`. Replicas aggrega
 
 A seed supports repeatability within a fixed software and hardware environment. Bitwise equality across NumPy versions, platforms, or computational backends is not guaranteed. The standard error `T / sqrt(N)` describes a terminal snapshot of `ideal-gas-ou-v1`. Free Langevin distinguishes thermal-temperature uncertainty, diffusion estimation and between-replica statistics. LJ uses its interacting-model observables and independent-replica summaries; correlated frames are not independent observations. These estimates do not include physical model error or measurement uncertainty.
 
+## Model contracts and Result Envelope
+
+`GET /api/v1/models` lists the three supported models; `GET /api/v1/models/MODEL_VERSION` returns one model's contract. Contracts describe input/result JSON Schemas, reduced units, scientific assumptions, invariants, diagnostics, required artifacts and NumPy/Numba semantics. Optional-backend availability is reported separately for the API process; it does not establish remote worker readiness.
+
+Every new successful calculation publishes `envelope.json` after its manifest. Existing status responses and `manifest.outputs` stay unchanged. Read the result envelope through the separate endpoints:
+
+```bash
+curl http://localhost:8000/api/v1/models
+curl http://localhost:8000/api/v1/simulations/TASK_ID/envelope
+curl http://localhost:8000/api/v1/simulations/TASK_ID/analyses/ANALYSIS_ID/envelope
+```
+
+The envelope links the result to the exact manifest bytes, artifact checksums and model contract. Each read verifies the saved files again. A mismatch produces `409`; a run without a recorded envelope declaration is explicitly `not_verified` when its envelope is absent. Unavailable uncertainty includes a reason: correlated LJ frames are not treated as independent observations.
+
+These checks establish consistency and integrity relative to saved metadata. They are not a digital signature, proof of authorship or independent physical-model validation. See the [API reference](docs/api_reference.md) for compatibility and verification limits.
+
 ## Optional dependencies
 
 The minimal installation runs the API and NumPy model. Install integrations explicitly:
